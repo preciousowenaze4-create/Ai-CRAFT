@@ -1,7 +1,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
+import {
+  extractAppLogoConfig,
+  extractLogoDirectiveFromRaw,
+  renderAppIconPng,
+  renderAppIconSvg,
+  type AppLogoConfig,
+} from './_appIcon.js';
 import { getSupabaseConfig } from './_supabaseAuth.js';
+
+export {
+  extractAppLogoConfig,
+  extractLogoDirectiveFromRaw,
+  renderAppIconPng,
+  renderAppIconSvg,
+  type AppLogoConfig,
+};
 
 export interface PublishedAppRecord {
   appId: string;
@@ -13,6 +28,7 @@ export interface PublishedAppRecord {
   html: string;
   publicEnv?: Record<string, string>;
   tables?: string[];
+  logo?: Partial<AppLogoConfig>;
   version: number;
   updatedAt: string;
 }
@@ -195,9 +211,131 @@ export function filterPublicSafeEnv(
   return safe;
 }
 
+export function getAppLogoConfig(record: PublishedAppRecord): AppLogoConfig {
+  return extractAppLogoConfig({
+    title: record.title,
+    html: record.html,
+    logoOverride: record.logo,
+  });
+}
+
+export function buildAppManifestJson(record: PublishedAppRecord) {
+  const logo = getAppLogoConfig(record);
+  const v = Math.max(1, Number(record.version) || 1);
+  const basePath = `/app/${record.appId}`;
+  return {
+    id: basePath,
+    name: record.title || 'App',
+    short_name: logo.shortName,
+    description: `${record.title} — Built with AI Craft`,
+    start_url: basePath,
+    scope: basePath,
+    display: 'standalone',
+    display_override: ['standalone', 'minimal-ui'],
+    orientation: record.mode === 'mobile' ? 'portrait' : 'any',
+    theme_color: logo.themeColor,
+    background_color: logo.backgroundColor,
+    icons: [
+      {
+        src: `${basePath}/icon-192.png?v=${v}`,
+        sizes: '192x192',
+        type: 'image/png',
+        purpose: 'any',
+      },
+      {
+        src: `${basePath}/icon-512.png?v=${v}`,
+        sizes: '512x512',
+        type: 'image/png',
+        purpose: 'any',
+      },
+      {
+        src: `${basePath}/icon-maskable.png?v=${v}`,
+        sizes: '512x512',
+        type: 'image/png',
+        purpose: 'maskable',
+      },
+    ],
+  };
+}
+
+export function buildAppServiceWorkerJs(record: PublishedAppRecord): string {
+  const basePath = `/app/${record.appId}`;
+  const cacheName = `aicraft-app-${record.appId}-v${Math.max(1, Number(record.version) || 1)}`;
+  return `const CACHE_NAME = ${JSON.stringify(cacheName)};
+const APP_URL = ${JSON.stringify(basePath)};
+const CORE_ASSETS = [
+  APP_URL,
+  ${JSON.stringify(`${basePath}/manifest.webmanifest?v=${Math.max(1, Number(record.version) || 1)}`)},
+  ${JSON.stringify(`${basePath}/icon-180.png?v=${Math.max(1, Number(record.version) || 1)}`)},
+  ${JSON.stringify(`${basePath}/icon-192.png?v=${Math.max(1, Number(record.version) || 1)}`)}
+];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(CORE_ASSETS)).catch(() => undefined)
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(
+        keys
+          .filter((k) => k.startsWith(${JSON.stringify(`aicraft-app-${record.appId}-`)}) && k !== CACHE_NAME)
+          .map((k) => caches.delete(k))
+      )
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  if (!url.pathname.startsWith(APP_URL)) return;
+
+  if (req.mode === 'navigate') {
+    event.respondWith(
+      fetch(req)
+        .then((res) => {
+          const clone = res.clone();
+          caches.open(CACHE_NAME).then((c) => c.put(APP_URL, clone)).catch(() => undefined);
+          return res;
+        })
+        .catch(() => caches.match(APP_URL))
+    );
+    return;
+  }
+
+  event.respondWith(
+    caches.match(req).then((cached) =>
+      cached ||
+      fetch(req).then((res) => {
+        const clone = res.clone();
+        caches.open(CACHE_NAME).then((c) => c.put(req, clone)).catch(() => undefined);
+        return res;
+      })
+    )
+  );
+});
+`;
+}
+
 export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
   let html = String(record.html || '').trim();
   if (!html) return '';
+
+  const logo = getAppLogoConfig(record);
+  const v = Math.max(1, Number(record.version) || 1);
+  const basePath = `/app/${record.appId}`;
+
+  // Strip any inherited or stale PWA icon/manifest tags so the app always uses its own generated logo & manifest
+  html = html
+    .replace(/<link\b[^>]*rel=["'](?:manifest|apple-touch-icon|icon|shortcut icon)["'][^>]*>/gi, '')
+    .replace(/<meta\b[^>]*name=["'](?:viewport|theme-color|mobile-web-app-capable|apple-mobile-web-app-capable|apple-mobile-web-app-status-bar-style|apple-mobile-web-app-title)["'][^>]*>/gi, '');
 
   const publicEnv = filterPublicSafeEnv(record.publicEnv);
   const safeEnvJson = JSON.stringify(publicEnv).replace(/</g, '\\u003c');
@@ -206,6 +344,28 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
     enabled: true,
     tables: Array.isArray(record.tables) ? record.tables : [],
   }).replace(/</g, '\\u003c');
+  const safePwaInfo = JSON.stringify({
+    appId: record.appId,
+    name: record.title,
+    shortName: logo.shortName,
+    themeColor: logo.themeColor,
+    backgroundColor: logo.backgroundColor,
+    logoUrl: `${basePath}/icon-180.png?v=${v}`,
+    svgLogoUrl: `${basePath}/icon.svg?v=${v}`,
+    manifestUrl: `${basePath}/manifest.webmanifest?v=${v}`,
+  }).replace(/</g, '\\u003c');
+
+  const pwaBaseStyle = `<style id="aicraft-pwa-base">
+  :root {
+    --aicraft-safe-top: env(safe-area-inset-top, 0px);
+    --aicraft-safe-bottom: env(safe-area-inset-bottom, 0px);
+    --aicraft-theme-color: ${logo.themeColor};
+  }
+  html, body {
+    overscroll-behavior-y: contain;
+    -webkit-tap-highlight-color: transparent;
+  }
+</style>`;
 
   const runtimeScript = `<script>
 (function(){
@@ -213,6 +373,7 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
   var envMap = ${safeEnvJson};
   var dbPrefix = ${safeDbPrefix};
   var dbMeta = ${safeDbMeta};
+  var pwaInfo = ${safePwaInfo};
   window.__AICRAFT_ENV__ = Object.assign({}, window.__AICRAFT_ENV__ || {}, envMap);
   window.ENV = Object.assign({}, window.ENV || {}, envMap);
   window.process = window.process || {};
@@ -290,6 +451,108 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
       return Promise.resolve(true);
     }
   };
+
+  var deferredInstallPrompt = null;
+  var installListeners = [];
+  window.addEventListener('beforeinstallprompt', function(e) {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    installListeners.forEach(function(fn) { try { fn(true); } catch (err) {} });
+  });
+
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function() {
+      navigator.serviceWorker
+        .register('/app/' + encodeURIComponent(pwaInfo.appId) + '/sw.js', { scope: '/app/' + pwaInfo.appId })
+        .catch(function() {});
+    });
+  }
+
+  var pwaApi = {
+    appId: pwaInfo.appId,
+    name: pwaInfo.name,
+    shortName: pwaInfo.shortName,
+    themeColor: pwaInfo.themeColor,
+    backgroundColor: pwaInfo.backgroundColor,
+    logoUrl: pwaInfo.logoUrl,
+    svgLogoUrl: pwaInfo.svgLogoUrl,
+    manifestUrl: pwaInfo.manifestUrl,
+    isStandalone: function() {
+      return Boolean(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+        Boolean(window.navigator && window.navigator.standalone);
+    },
+    isIOS: function() {
+      return /iPad|iPhone|iPod/.test(navigator.userAgent || '') && !window.MSStream;
+    },
+    canInstall: function() {
+      return Boolean(deferredInstallPrompt);
+    },
+    onInstallReady: function(cb) {
+      if (typeof cb !== 'function') return;
+      installListeners.push(cb);
+      if (deferredInstallPrompt) cb(true);
+    },
+    promptInstall: function() {
+      if (!deferredInstallPrompt) {
+        return Promise.resolve({ outcome: pwaApi.isIOS() ? 'ios_manual' : 'unavailable' });
+      }
+      var p = deferredInstallPrompt;
+      deferredInstallPrompt = null;
+      return p.prompt().then(function() { return p.userChoice; }).catch(function() { return { outcome: 'dismissed' }; });
+    }
+  };
+
+  var browserApi = {
+    setThemeColor: function(hex) {
+      if (!hex) return;
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (!meta) {
+        meta = document.createElement('meta');
+        meta.name = 'theme-color';
+        document.head.appendChild(meta);
+      }
+      meta.content = String(hex);
+    },
+    setTitle: function(nextTitle) {
+      if (nextTitle) document.title = String(nextTitle);
+    },
+    share: function(data) {
+      if (navigator.share) return navigator.share(data || { title: document.title, url: window.location.href });
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText((data && data.url) || window.location.href);
+      }
+      return Promise.resolve();
+    },
+    copy: function(text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(String(text || ''));
+      }
+      return Promise.resolve();
+    },
+    vibrate: function(pattern) {
+      try { if (navigator.vibrate) return navigator.vibrate(pattern || 18); } catch (e) {}
+      return false;
+    },
+    requestFullscreen: function(el) {
+      var target = el || document.documentElement;
+      if (target && target.requestFullscreen) return target.requestFullscreen().catch(function(){});
+      return Promise.resolve();
+    },
+    getGeolocation: function(opts) {
+      return new Promise(function(resolve, reject) {
+        if (!navigator.geolocation) return reject(new Error('Geolocation not supported'));
+        navigator.geolocation.getCurrentPosition(resolve, reject, opts);
+      });
+    },
+    notify: function(title, opts) {
+      if (typeof Notification === 'undefined') return Promise.resolve(null);
+      if (Notification.permission === 'granted') return Promise.resolve(new Notification(title, opts));
+      return Notification.requestPermission().then(function(perm) {
+        return perm === 'granted' ? new Notification(title, opts) : null;
+      });
+    }
+  };
+
   window.AICraft = {
     __standalone: true,
     env: envMap,
@@ -298,6 +561,8 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
     hasSecret: function(key) { return Boolean(getSecretFn(key)); },
     findSecret: findSecretFn,
     db: dbApi,
+    pwa: pwaApi,
+    browser: browserApi,
     search: function(query) {
       return fetch('/api/search?q=' + encodeURIComponent(String(query || ''))).then(function(r) { return r.json(); });
     },
@@ -309,16 +574,27 @@ export function buildStandaloneAppHtml(record: PublishedAppRecord): string {
 </script>`;
 
   const safeTitle = record.title.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const headAdditions: string[] = [];
-  if (!/<meta\b[^>]*name=["']viewport["']/i.test(html)) {
-    headAdditions.push(
-      '<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />'
-    );
-  }
+  const safeShortName = logo.shortName.replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const statusBarStyle = logo.isDark ? 'black-translucent' : 'default';
+
+  const headAdditions: string[] = [
+    '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />',
+    `<meta name="theme-color" content="${logo.themeColor}" />`,
+    '<meta name="mobile-web-app-capable" content="yes" />',
+    '<meta name="apple-mobile-web-app-capable" content="yes" />',
+    `<meta name="apple-mobile-web-app-status-bar-style" content="${statusBarStyle}" />`,
+    `<meta name="apple-mobile-web-app-title" content="${safeShortName}" />`,
+    `<link rel="manifest" href="${basePath}/manifest.webmanifest?v=${v}" />`,
+    `<link rel="apple-touch-icon" sizes="180x180" href="${basePath}/icon-180.png?v=${v}" />`,
+    `<link rel="icon" type="image/png" sizes="192x192" href="${basePath}/icon-192.png?v=${v}" />`,
+    `<link rel="icon" type="image/png" sizes="32x32" href="${basePath}/icon-192.png?v=${v}" />`,
+    `<link rel="icon" type="image/svg+xml" href="${basePath}/icon.svg?v=${v}" />`,
+  ];
+
   if (!/<title\b[^>]*>/i.test(html)) {
     headAdditions.push(`<title>${safeTitle}</title>`);
   }
-  headAdditions.push(runtimeScript);
+  headAdditions.push(pwaBaseStyle, runtimeScript);
 
   const injection = headAdditions.join('\n');
   if (/<head\b[^>]*>/i.test(html)) {

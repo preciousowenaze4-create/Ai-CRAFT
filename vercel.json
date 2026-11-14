@@ -30,6 +30,38 @@
       "destination": "/api/:match*"
     },
     {
+      "source": "/app/:id/manifest.webmanifest",
+      "destination": "/api/apps?id=:id&asset=manifest"
+    },
+    {
+      "source": "/app/:id/sw.js",
+      "destination": "/api/apps?id=:id&asset=sw"
+    },
+    {
+      "source": "/app/:id/icon.svg",
+      "destination": "/api/apps?id=:id&asset=icon-svg"
+    },
+    {
+      "source": "/app/:id/icon-180.png",
+      "destination": "/api/apps?id=:id&asset=icon-180"
+    },
+    {
+      "source": "/app/:id/icon-192.png",
+      "destination": "/api/apps?id=:id&asset=icon-192"
+    },
+    {
+      "source": "/app/:id/icon-512.png",
+      "destination": "/api/apps?id=:id&asset=icon-512"
+    },
+    {
+      "source": "/app/:id/icon-maskable.png",
+      "destination": "/api/apps?id=:id&asset=icon-maskable"
+    },
+    {
+      "source": "/app/:id/",
+      "destination": "/api/apps?id=:id"
+    },
+    {
       "source": "/app/:id",
       "destination": "/api/apps?id=:id"
     },

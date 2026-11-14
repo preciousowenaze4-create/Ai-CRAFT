@@ -956,6 +956,7 @@ export default function App() {
         title?: string;
         slug?: string;
         customAppId?: string;
+        logo?: Record<string, string>;
         forceBump?: boolean;
       }
     ) => {
@@ -972,12 +973,17 @@ export default function App() {
       const resolvedSlug = slugifyAppTitle(
         overrides?.slug || proj.deployment?.slug || resolvedTitle
       );
-      const shortSuffix =
-        proj.id.replace(/[^a-z0-9]/gi, '').slice(-5).toLowerCase() || 'app';
       const targetAppId = overrides?.customAppId
         ? slugifyAppTitle(overrides.customAppId)
-        : proj.deployment?.appId || `${resolvedSlug}-${shortSuffix}`;
+        : proj.deployment?.appId || resolvedSlug;
+      const nextLogo = overrides?.logo ?? proj.deployment?.logo;
       const nextVersion = Math.max(1, (proj.deployment?.version ?? 0) + 1);
+      const configuredOrigin = (
+        import.meta.env.VITE_PUBLIC_APP_ORIGIN as string | undefined
+      )
+        ?.trim()
+        .replace(/\/+$/, '');
+      const publicOrigin = configuredOrigin || window.location.origin;
 
       setProjects((prev) =>
         prev.map((p) => {
@@ -989,6 +995,9 @@ export default function App() {
               slug: p.deployment?.slug || resolvedSlug,
               appId: p.deployment?.appId || targetAppId,
               liveUrl: p.deployment?.liveUrl,
+              logoUrl: p.deployment?.logoUrl,
+              themeColor: p.deployment?.themeColor,
+              logo: nextLogo,
               livePublishing: true,
               version: p.deployment?.version ?? 0,
               deployedAt: p.deployment?.deployedAt ?? null,
@@ -1021,6 +1030,7 @@ export default function App() {
             html: trimmedHtml,
             publicEnv,
             tables: (proj.databaseConfig?.tables ?? []).map((t) => t.name),
+            logo: nextLogo,
             version: overrides?.forceBump ? nextVersion : nextVersion,
           }),
         });
@@ -1030,14 +1040,20 @@ export default function App() {
           appId?: string;
           slug?: string;
           path?: string;
+          logoUrl?: string;
+          themeColor?: string;
           version?: number;
           deployedAt?: string;
         };
 
         if (res.ok && data.ok && data.path) {
-          const liveUrl = `${window.location.origin}${data.path}`;
+          const liveUrl = `${publicOrigin}${data.path}`;
           const finalAppId = data.appId || targetAppId;
           const finalSlug = data.slug || resolvedSlug;
+          const logoUrl = data.logoUrl
+            ? `${publicOrigin}${data.logoUrl}`
+            : `${publicOrigin}/app/${finalAppId}/icon-180.png?v=${typeof data.version === 'number' ? data.version : nextVersion}`;
+          const themeColor = data.themeColor || proj.deployment?.themeColor;
           const deployedAt = data.deployedAt || new Date().toISOString();
           const version =
             typeof data.version === 'number' && data.version > 0
@@ -1058,6 +1074,9 @@ export default function App() {
                   slug: finalSlug,
                   appId: finalAppId,
                   liveUrl,
+                  logoUrl,
+                  themeColor,
+                  logo: nextLogo,
                   livePublishing: false,
                   version,
                   deployedAt,
@@ -1245,6 +1264,7 @@ export default function App() {
                 pausedAt?: string;
                 thoughtSeconds?: number;
                 title?: string;
+                logo?: Record<string, string>;
               };
 
               if (evt.type === 'job' && evt.jobId) {
@@ -1503,6 +1523,7 @@ export default function App() {
                 if (builtHtmlForLink) {
                   void publishProjectLive(projectId, builtHtmlForLink, {
                     title: evt.title,
+                    logo: evt.logo,
                   });
                 }
                 if (Array.isArray(evt.dbTables) && evt.dbTables.length > 0) {
@@ -2134,12 +2155,17 @@ export default function App() {
     };
   }, [publishProjectLive, syncBillingFromServer, updateProjectTitle, updateTurn]);
 
-  // Automatically generate a live app link for any active built project missing one
+  // Automatically generate a live app link + custom logo for any active built project missing them
   const autoPublishedIdsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!activeProject) return;
     if (isProjectWorking(activeProject)) return;
-    if (activeProject.deployment?.liveUrl || activeProject.deployment?.livePublishing) return;
+    if (
+      (activeProject.deployment?.liveUrl && activeProject.deployment?.logoUrl) ||
+      activeProject.deployment?.livePublishing
+    ) {
+      return;
+    }
     if (autoPublishedIdsRef.current.has(activeProject.id)) return;
     const builtHtml =
       [...activeProject.turns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';

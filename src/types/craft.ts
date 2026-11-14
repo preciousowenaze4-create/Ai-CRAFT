@@ -102,6 +102,9 @@ export interface ProjectDeploymentConfig {
   slug: string;
   appId?: string;
   liveUrl?: string;
+  logoUrl?: string;
+  themeColor?: string;
+  logo?: Record<string, string>;
   livePublishing?: boolean;
   version: number;
   deployedAt: string | null;

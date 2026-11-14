@@ -78,6 +78,7 @@ function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
   const cleaned = raw
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
     .replace(/\[\[\s*TITLE\s*:[^\]]*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*LOGO\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*DB_SCHEMA\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '');
@@ -525,6 +526,71 @@ export function BuilderWorkspace({
       window.parent.postMessage({ type: 'aicraft:search', id: id, query: String(query || '') }, '*');
     });
   }
+  function getPreviewThemeColor() {
+    var m = document.querySelector('meta[name="theme-color"]');
+    return (m && m.getAttribute('content')) || '#0F172A';
+  }
+  var pwaBridge = {
+    isStandalone: function() {
+      return Boolean((window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true);
+    },
+    isIOS: function() {
+      return /iphone|ipad|ipod/i.test(navigator.userAgent || '');
+    },
+    canInstall: function() { return false; },
+    onInstallReady: function() {},
+    promptInstall: function() {
+      return Promise.resolve({
+        outcome: 'dismissed',
+        platform: 'preview',
+        message: 'Open your Live App Link in Safari or Chrome to install with its custom Home Screen icon.'
+      });
+    },
+    get themeColor() { return getPreviewThemeColor(); }
+  };
+  var browserBridge = {
+    setThemeColor: function(hex) {
+      if (!hex) return;
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (!meta) {
+        meta = document.createElement('meta');
+        meta.setAttribute('name', 'theme-color');
+        document.head && document.head.appendChild(meta);
+      }
+      meta.setAttribute('content', String(hex));
+    },
+    setTitle: function(title) {
+      if (title) document.title = String(title);
+    },
+    share: function(data) {
+      if (navigator.share) return navigator.share(data || { title: document.title, url: window.location.href });
+      if (navigator.clipboard && data && (data.url || data.text)) return navigator.clipboard.writeText(data.url || data.text);
+      return Promise.resolve();
+    },
+    copy: function(text) {
+      return navigator.clipboard ? navigator.clipboard.writeText(String(text || '')) : Promise.resolve();
+    },
+    vibrate: function(pattern) {
+      return navigator.vibrate ? navigator.vibrate(pattern || 12) : false;
+    },
+    requestFullscreen: function(el) {
+      var target = el || document.documentElement;
+      return target && target.requestFullscreen ? target.requestFullscreen() : Promise.resolve();
+    },
+    getGeolocation: function(opts) {
+      return new Promise(function(resolve, reject) {
+        if (!navigator.geolocation) return reject(new Error('Geolocation unavailable'));
+        navigator.geolocation.getCurrentPosition(resolve, reject, opts || { enableHighAccuracy: true, timeout: 8000 });
+      });
+    },
+    notify: function(title, opts) {
+      if (!('Notification' in window)) return Promise.resolve(null);
+      if (Notification.permission === 'granted') return Promise.resolve(new Notification(title, opts));
+      return Notification.requestPermission().then(function(p) {
+        return p === 'granted' ? new Notification(title, opts) : null;
+      });
+    }
+  };
   window.AICraft = {
     env: envMap,
     secretKeys: Object.keys(envMap),
@@ -532,6 +598,8 @@ export function BuilderWorkspace({
     hasSecret: function(key) { return Boolean(getSecretFn(key)); },
     findSecret: findSecretFn,
     db: dbApi,
+    pwa: pwaBridge,
+    browser: browserBridge,
     ask: ask,
     chat: ask,
     search: search,
@@ -1066,7 +1134,7 @@ export function BuilderWorkspace({
             key={`${projectId}-${previewKey}-${secretsFingerprint}`}
             title={`${projectTitle} Preview`}
             srcDoc={connectedPreviewHtml}
-            sandbox="allow-scripts allow-forms allow-modals"
+            sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"
             className="w-full h-full border-0 block bg-white"
           />
         ) : (
@@ -1741,10 +1809,24 @@ export function BuilderWorkspace({
                               </div>
 
                               {deployment.liveUrl && (
-                                <div className="rounded-xl border border-black/[0.09] bg-white px-3 py-2 flex items-center gap-2">
-                                  <span className="font-mono text-[12px] text-[#0B0B0F] truncate flex-1 select-all">
-                                    {deployment.liveUrl}
-                                  </span>
+                                <div className="rounded-xl border border-black/[0.09] bg-white px-3 py-2 flex items-center gap-2.5">
+                                  {deployment.logoUrl && (
+                                    <img
+                                      src={deployment.logoUrl}
+                                      alt={`${projectTitle} icon`}
+                                      className="w-8 h-8 rounded-lg object-cover border border-black/10 shrink-0"
+                                    />
+                                  )}
+                                  <div className="min-w-0 flex-1">
+                                    <span className="block font-mono text-[12px] text-[#0B0B0F] truncate select-all">
+                                      {deployment.liveUrl}
+                                    </span>
+                                    {deployment.logoUrl && (
+                                      <span className="block text-[10.5px] text-[#71717A] truncate">
+                                        Custom app icon · Add to Home Screen ready
+                                      </span>
+                                    )}
+                                  </div>
                                   <button
                                     type="button"
                                     onClick={() => void handleCopyLiveUrl()}

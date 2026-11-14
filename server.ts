@@ -31,14 +31,21 @@ import {
   upgradeUserAccountFromTransaction,
 } from './api/_billing.js';
 import {
+  buildAppManifestJson,
+  buildAppServiceWorkerJs,
   buildNotFoundAppHtml,
   buildStandaloneAppHtml,
   deriveServerSessionTitle,
+  extractLogoDirectiveFromRaw,
   filterPublicSafeEnv,
+  getAppLogoConfig,
   loadPublishedApp,
+  renderAppIconPng,
+  renderAppIconSvg,
   sanitizeAppId,
   sanitizeSessionTitle,
   savePublishedApp,
+  type AppLogoConfig,
 } from './api/_appsStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1155,8 +1162,15 @@ function extractPreviewStructureSummary(previousHtml: string): string {
     .slice(0, 18)
     .map((m) => `<${m[1].toLowerCase()} id="${m[2]}">`);
 
+  const titleMatch = /<title\b[^>]*>([^<]{1,60})<\/title>/i.exec(previousHtml);
+  const themeMatch = /<meta\b[^>]*name=["']theme-color["'][^>]*content=["']([^"']+)["']/i.exec(previousHtml);
+  const logoMatch = /<meta\b[^>]*name=["']aicraft-logo["'][^>]*>/i.exec(previousHtml);
+
   return [
     `Live Preview already holds a rendered app (${previousHtml.length} chars).`,
+    titleMatch ? `Current app title: "${titleMatch[1].trim()}".` : '',
+    themeMatch ? `Current browser theme-color: ${themeMatch[1].trim()}.` : '',
+    logoMatch ? `Current app logo meta: ${logoMatch[0]}.` : '',
     items.length > 0 ? `Existing artifacts: ${items.join(', ')}.` : '',
     idMatches.length > 0 ? `Existing DOM sections/IDs: ${idMatches.join(', ')}.` : '',
   ]
@@ -1322,6 +1336,7 @@ function stripTagMarkers(text: string): string {
   return text
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*TITLE\s*:[^\]]*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*LOGO\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*DB_SCHEMA\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '');
@@ -2529,9 +2544,67 @@ async function startServer() {
     res.json({ synced: saved });
   });
 
+  const normalizeAssetParam = (raw: string): string => {
+    const s = raw.trim().toLowerCase();
+    if (s === 'manifest.webmanifest' || s === 'manifest.json' || s === 'manifest') return 'manifest';
+    if (s === 'sw.js' || s === 'sw') return 'sw';
+    if (s === 'icon.svg' || s === 'icon-svg') return 'icon-svg';
+    if (s === 'icon-180.png' || s === 'apple-touch-icon.png' || s === 'icon-180') return 'icon-180';
+    if (s === 'icon-192.png' || s === 'icon-192') return 'icon-192';
+    if (s === 'icon-512.png' || s === 'icon-512') return 'icon-512';
+    if (s === 'icon-maskable.png' || s === 'icon-maskable') return 'icon-maskable';
+    return '';
+  };
+
+  const servePublishedAsset = (
+    res: express.Response,
+    record: NonNullable<Awaited<ReturnType<typeof loadPublishedApp>>>,
+    asset: string
+  ) => {
+    if (asset === 'manifest') {
+      res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.send(JSON.stringify(buildAppManifestJson(record)));
+      return true;
+    }
+    if (asset === 'sw') {
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+      res.setHeader('Service-Worker-Allowed', `/app/${record.appId}`);
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.send(buildAppServiceWorkerJs(record));
+      return true;
+    }
+    if (asset === 'icon-svg') {
+      const logo = getAppLogoConfig(record);
+      res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.send(renderAppIconSvg(logo));
+      return true;
+    }
+    if (
+      asset === 'icon-180' ||
+      asset === 'icon-192' ||
+      asset === 'icon-512' ||
+      asset === 'icon-maskable'
+    ) {
+      const logo = getAppLogoConfig(record);
+      const pngSize = asset === 'icon-180' ? 180 : asset === 'icon-192' ? 192 : 512;
+      const pngBuf = renderAppIconPng(logo, pngSize, {
+        maskable: asset === 'icon-maskable',
+        opaqueFullBleed: asset === 'icon-180' || asset === 'icon-maskable',
+      });
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.send(pngBuf);
+      return true;
+    }
+    return false;
+  };
+
   app.get('/api/apps', async (req, res) => {
     const rawId = typeof req.query.id === 'string' ? req.query.id : '';
     const cleanId = sanitizeAppId(rawId);
+    const asset = typeof req.query.asset === 'string' ? normalizeAssetParam(req.query.asset) : '';
     if (!rawId || !cleanId) {
       res.status(404).setHeader('Content-Type', 'text/html; charset=utf-8');
       res.send(buildNotFoundAppHtml(rawId || 'app'));
@@ -2539,7 +2612,7 @@ async function startServer() {
     }
     const record = await loadPublishedApp(cleanId);
     if (!record || !record.html) {
-      if (req.query.format === 'json') {
+      if (req.query.format === 'json' || asset === 'manifest') {
         res.status(404).json({ exists: false, appId: cleanId });
         return;
       }
@@ -2547,7 +2620,11 @@ async function startServer() {
       res.send(buildNotFoundAppHtml(cleanId));
       return;
     }
+    if (asset && servePublishedAsset(res, record, asset)) {
+      return;
+    }
     if (req.query.format === 'json') {
+      const logo = getAppLogoConfig(record);
       res.setHeader('Cache-Control', 'no-store');
       res.json({
         exists: true,
@@ -2557,6 +2634,9 @@ async function startServer() {
         slug: record.slug,
         mode: record.mode,
         version: record.version,
+        themeColor: logo.themeColor,
+        logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
+        manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
         updatedAt: record.updatedAt,
       });
       return;
@@ -2564,6 +2644,23 @@ async function startServer() {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store, max-age=0');
     res.send(buildStandaloneAppHtml(record));
+  });
+
+  app.get('/app/:id/:asset', async (req, res) => {
+    const cleanId = sanitizeAppId(req.params.id || '');
+    const asset = normalizeAssetParam(req.params.asset || '');
+    if (!asset) {
+      res.status(404).send('Asset not found');
+      return;
+    }
+    const record = await loadPublishedApp(cleanId);
+    if (!record || !record.html) {
+      res.status(404).json({ exists: false, appId: cleanId });
+      return;
+    }
+    if (!servePublishedAsset(res, record, asset)) {
+      res.status(404).send('Asset not found');
+    }
   });
 
   app.get('/app/:id', async (req, res) => {
@@ -2589,6 +2686,7 @@ async function startServer() {
       html?: string;
       publicEnv?: Record<string, string>;
       tables?: string[];
+      logo?: Partial<AppLogoConfig>;
       version?: number;
     };
     const html = typeof body.html === 'string' ? body.html.trim() : '';
@@ -2627,24 +2725,30 @@ async function startServer() {
       targetAppId = sanitizeAppId(`${slug}-${suffix}`);
     }
 
+    const resolvedExisting =
+      targetAppId === existing?.appId ? existing : await loadPublishedApp(targetAppId);
+
     const nextVersion =
       typeof body.version === 'number' && Number.isFinite(body.version) && body.version > 0
         ? Math.floor(body.version)
-        : (existing?.version ?? 0) + 1;
+        : (resolvedExisting?.version ?? 0) + 1;
 
     const { record } = await savePublishedApp({
       appId: targetAppId,
       projectId,
-      ownerId: auth.user?.id || existing?.ownerId,
+      ownerId: auth.user?.id || resolvedExisting?.ownerId,
       title: typeof body.title === 'string' && body.title.trim() ? body.title.trim() : 'AI Craft App',
       slug,
       mode: body.mode === 'web' ? 'web' : 'mobile',
       html,
       publicEnv: filterPublicSafeEnv(body.publicEnv),
       tables: Array.isArray(body.tables) ? body.tables.filter((t) => typeof t === 'string') : [],
+      logo: body.logo && typeof body.logo === 'object' ? body.logo : undefined,
       version: nextVersion,
       updatedAt: new Date().toISOString(),
     });
+
+    const logo = getAppLogoConfig(record);
 
     res.setHeader('Cache-Control', 'no-store');
     res.json({
@@ -2652,6 +2756,9 @@ async function startServer() {
       appId: record.appId,
       slug: record.slug,
       path: `/app/${record.appId}`,
+      logoUrl: `/app/${record.appId}/icon-180.png?v=${record.version}`,
+      manifestUrl: `/app/${record.appId}/manifest.webmanifest?v=${record.version}`,
+      themeColor: logo.themeColor,
       version: record.version,
       deployedAt: record.updatedAt,
     });
@@ -3134,6 +3241,7 @@ async function startServer() {
           : '- The project Database drawer automatically captures and structures real-time tables as the app is built and used — users never manually enter Supabase URLs or table forms inside Database.',
         '- REAL SUPABASE + GOOGLE LOGIN + REAL DATABASE WIRING: When Supabase secrets (`supabase-project-url` and `supabase-anon-key`/`jwt-token`/`supabase-credential`) are configured in Secrets OR requested by the user (e.g. WhatsApp/chat app with Google Login & real DB): load `@supabase/supabase-js@2` via `<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>`, initialize `window.supabase.createClient(sbUrl, sbKey)` using the exact key names found in Secrets (`getSecret` + `findSecret` fallback), wire real `supabaseClient.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })` + `onAuthStateChange` + real `supabaseClient.from(table).select/insert/update/delete`, AND sync records into `window.AICraft.db` (`list`, `insert`, `update`, `remove`) while emitting `[[DB_SCHEMA: ...]]` lines so BOTH real cloud Postgres AND AI Craft Database explorer reflect real live data.',
         '- BUILT-IN REAL-TIME DATABASE API: For every app with data persistence, persist records via `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, `await window.AICraft.db.remove("table", id)`.',
+        '- FULL STANDALONE PWA, CUSTOM BRAND LOGO & BROWSER ACCESS: Every app you build gets its own standalone hosted browser link (`/app/...`), its own Web App Manifest, its own scoped Service Worker, and its own generated PNG/SVG Home Screen icons — it NEVER inherits AI Craft\'s logo! Inside generated apps, you have FULL browser & PWA access via `window.AICraft.pwa` (`isStandalone()`, `isIOS()`, `canInstall()`, `promptInstall()`, `onInstallReady(cb)`, `logoUrl`, `themeColor`) and `window.AICraft.browser` (`setThemeColor(hex)`, `setTitle(str)`, `share(data)`, `copy(text)`, `vibrate(ms)`, `requestFullscreen()`, `getGeolocation()`, `notify(title, opts)`), plus standard Web APIs (`navigator.mediaDevices`, `localStorage`, `fetch`, Canvas, Audio, etc.).',
       ].join('\n');
 
       const previewSummary = extractPreviewStructureSummary(previousHtml);
@@ -3151,15 +3259,18 @@ async function startServer() {
         'Before writing any HTML, slow down and think carefully like a senior product architect & monetization strategist:',
         titleRuleForBuild,
         'STEP 0 (Architectural Planning & Structured Database Lines): Output 4 short planning lines using exact format `[[PLAN: <step>]]` covering:',
-        '  1) `[[PLAN: Color palette & typography — ...]]` (choose a refined, harmonious color palette, high-contrast surfaces, crisp font hierarchy)',
-        '  2) `[[PLAN: Layout & button placement — ...]]` (plan clean visual structure, thumb-friendly 44px+ buttons, intuitive header & bottom nav placement, balanced spacing)',
-        '  3) `[[PLAN: Real-time features, secrets & database — ...]]` (plan real clocks/timers, real Secrets integration if needed, `window.AICraft.db` / Supabase persistence, live `window.AICraft.search(query)` / `window.AICraft.ask(prompt)`, and verified search images or crisp inline SVGs)',
+        '  1) `[[PLAN: Color palette, brand logo & typography — ...]]` (choose a refined, harmonious color palette, design a custom app icon/logo matching the user description/color, and crisp font hierarchy)',
+        '  2) `[[PLAN: Layout, browser bar & button placement — ...]]` (plan clean mobile-app PWA layout, safe-area top/bottom spacing, matching browser theme-color, thumb-friendly 44px+ buttons, intuitive header & bottom nav placement)',
+        '  3) `[[PLAN: Real-time features, secrets & database — ...]]` (plan real clocks/timers, real Secrets integration if needed, `window.AICraft.db` / Supabase persistence, live `window.AICraft.search(query)` / `window.AICraft.ask(prompt)`, full browser APIs, and verified search images or crisp inline SVGs)',
         '  4) `[[PLAN: Monetization & growth flow — ...]]` (plan built-in interactive monetization tailored to the app: Pro/Premium plan sheet, monthly/annual toggle, credits/checkout drawer, creator tips, or revenue metrics)',
         'STEP 0B (Automatic Real-Time Database Schema Lines): Whenever the app you are building stores or manages data (e.g. WhatsApp -> `users`, `chats`, `messages`; TikTok -> `profiles`, `videos`, `comments`, `likes`; store -> `products`, `orders`), IMMEDIATELY output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Example: `[[DB_SCHEMA: messages(id:text, chat_id:text, sender_id:text, body:text, created_at:timestamp)]]`.',
-        'PART 1 (Architectural Overview & Feedback): Write 2–3 calm, clear plain-text sentences summarizing the structure, color choices, button layout, real-time database/features, connected Secrets keys (if any), and monetization you built, plus brief feedback on how it can grow next. ABSOLUTELY PROHIBITED IN PART 1: NEVER include raw code, HTML tags, CSS, JS, markdown code fences (```), backticks, or the words "PART 1" / "PART 2" / "PART 3", and NEVER tell the user to copy/paste code.',
+        'STEP 0C (Custom Brand Logo Tag): Output one `[[LOGO: bg=#HEX, accent=#HEX, theme=#HEX, motif=play|chat|bag|music|camera|heart|bolt|star|wallet|map|flame|spark|letter, letters=XX]]` line tailored to the user\'s app & any color they asked for (e.g. if user says "red logo", set `bg=#DC2626` and `theme=#DC2626`). NEVER output AI Craft\'s logo.',
+        'PART 1 (Architectural Overview & Feedback): Write 2–3 calm, clear plain-text sentences summarizing the structure, custom logo & browser/PWA theme, button layout, real-time database/features, connected Secrets keys (if any), and monetization you built, plus brief feedback on how it can grow next. ABSOLUTELY PROHIBITED IN PART 1: NEVER include raw code, HTML tags, CSS, JS, markdown code fences (```), backticks, or the words "PART 1" / "PART 2" / "PART 3", and NEVER tell the user to copy/paste code.',
         'PART 2 (Full-Screen Real-Time App): On a new line immediately output the exact marker <<<AICRAFT_APP_HTML>>> followed by a complete, thoughtfully crafted, self-contained, runnable <!DOCTYPE html> application ending with <<<END_AICRAFT_APP_HTML>>>.',
         'Rules for the HTML app in PART 2:',
-        `- Design it as a refined ${targetLabel} experience inside AI Craft's full-screen Preview tab.`,
+        `- Design it as a refined ${targetLabel} experience inside AI Craft\'s full-screen Preview tab AND when opened in a mobile browser or installed to Home Screen as a standalone PWA.`,
+        '- MANDATORY CUSTOM LOGO & BROWSER PWA HEAD TAGS: Inside `<head>`, ALWAYS include: `<meta name="theme-color" content="#HEX" />` matching the app header/brand color, `<meta name="background-color" content="#HEX" />`, and `<meta name="aicraft-logo" data-bg="#HEX" data-accent="#HEX" data-theme="#HEX" data-motif="play|chat|bag|music|camera|heart|bolt|star|wallet|map|flame|spark|letter" data-letters="XX" />`. Also render a crisp custom inline `<svg id="aicraft-app-icon" viewBox="0 0 128 128" ...>` (used BOTH as the visible app brand mark in the header AND automatically converted into the Home Screen PNG icon!). If the user asks for a red logo, green logo, specific icon, or mobile PWA look, update these tags AND the header logo immediately!',
+        '- NATIVE MOBILE PWA & SAFE-AREA DESIGN: Support safe areas cleanly (`padding-top: max(12px, env(safe-area-inset-top));` on sticky headers and `padding-bottom: max(12px, env(safe-area-inset-bottom));` on bottom nav bars), use `min-height: 100dvh`, dynamic browser bar sync via `window.AICraft?.browser?.setThemeColor?.("#HEX")`, and optionally include a subtle in-app "Install App" / "Add to Home Screen" button wired to `window.AICraft?.pwa?.promptInstall?.()` (falling back to concise iOS Safari Share -> Add to Home Screen instructions when `window.AICraft?.pwa?.isIOS?.()` is true and `!window.AICraft?.pwa?.isStandalone?.()`).',
         '- COHESIVE COLOR & ERGONOMIC BUTTONS: Craft a polished color system (clean surface hierarchy, tasteful accent, accessible contrast), smooth transitions, and well-placed >= 44px touch-target buttons (clear primary CTA, uncluttered header, intuitive navigation).',
         '- REAL-TIME STRUCTURED DATABASE & PERSISTENCE: Persist all app data via `window.AICraft.db` (`list`, `insert`, `update`, `remove`) — and when Supabase secrets exist, connect real `@supabase/supabase-js@2` queries + auth synced seamlessly with `window.AICraft.db`. On first load, if `await window.AICraft.db.list(table)` is empty, seed 2–4 realistic starter rows via `window.AICraft.db.insert(...)` so the app and live Database drawer work immediately.',
         '- PROJECT SECRETS ACCESS & REAL INTEGRATIONS: Never hardcode API keys. Always resolve secrets via `window.AICraft?.getSecret?.("EXACT_KEY") || window.AICraft?.findSecret?.("alias1", "alias2") || window.ENV?.EXACT_KEY || ""`. Handle missing keys cleanly in-app by showing which key name to paste in the AI Craft Secrets drawer.',
@@ -3225,7 +3336,7 @@ async function startServer() {
           'First decide carefully whether the user message is:',
           '(A) CHAT / QUESTION: A question, greeting, explanation request, feedback discussion, or normal conversation (even if an app was already built in Preview).',
           `    -> Start your output on the VERY FIRST LINE with exactly \`[[INTENT:CHAT]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, then write a natural, helpful conversational reply. Do NOT output HTML, code blocks, or rebuild the app.`,
-          '(B) BUILD / EDIT APP: A request to create/build a new app or website, OR a request to change, cut, remove, fix, or add something in the Preview app.',
+          '(B) BUILD / EDIT APP: A request to create/build a new app or website, OR ANY request to change, style, restyle, cut, remove, fix, add features, update the Home Screen logo/icon/color, customize browser toolbar theme-color, or make the app look/work like a native mobile PWA when added to Home Screen.',
           '    -> Start your output on the VERY FIRST LINE with exactly `[[INTENT:BUILD]]` followed by a newline, then output TWO strictly separated parts:',
           buildRulesBlock,
           activeFlags.length > 0 ? `Enabled capabilities: ${activeFlags.join(', ')}.` : '',
@@ -3945,6 +4056,7 @@ async function startServer() {
           sendEvent({ type: 'title', title: finalTitle });
         }
 
+        const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
         const finalInfo = resolveModelInfo(modelUsed || requestedModel || 'openrouter/auto');
         sendEvent({
           type: 'paused',
@@ -3952,6 +4064,7 @@ async function startServer() {
           message: exhaustInfo.error,
           kind: 'build',
           title: finalTitle,
+          logo: finalLogo,
           fullText:
             partialProse ||
             'Build progress was automatically saved right when your remaining tokens ran out.',
@@ -4054,11 +4167,13 @@ async function startServer() {
           ).catch(() => null)) ?? initialBillingSummary;
       }
 
+      const finalLogo = extractLogoDirectiveFromRaw(fullRaw) ?? undefined;
       const finalInfo = resolveModelInfo(modelUsed);
       sendEvent({
         type: 'done',
         kind: resolvedKind,
         title: finalTitle,
+        logo: finalLogo,
         fullText: finalProse,
         previewHtml,
         allFiles: finalFiles,
