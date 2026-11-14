@@ -1075,6 +1075,7 @@ export function ProjectDeployModal({
   );
   const [includeSecretsInExport, setIncludeSecretsInExport] = useState(false);
   const [statusNote, setStatusNote] = useState<string | null>(null);
+  const [copiedLiveUrl, setCopiedLiveUrl] = useState(false);
 
   useEffect(() => {
     setSlugInput(deployment.slug || slugifyProjectTitle(projectTitle));
@@ -1129,6 +1130,18 @@ export function ProjectDeployModal({
     setStatusNote(msg);
   };
 
+  const handleCopyLiveUrl = async () => {
+    if (!deployment.liveUrl) return;
+    try {
+      await navigator.clipboard.writeText(deployment.liveUrl);
+      setCopiedLiveUrl(true);
+      setStatusNote('Live app link copied');
+      window.setTimeout(() => setCopiedLiveUrl(false), 2000);
+    } catch {
+      // ignore clipboard restriction
+    }
+  };
+
   return (
     <DrawerShell
       open={open}
@@ -1175,6 +1188,60 @@ export function ProjectDeployModal({
             </div>
           </div>
         </div>
+
+        {(deployment.liveUrl || deployment.livePublishing) && (
+          <div className="p-3.5 rounded-2xl border border-black/[0.08] bg-white flex flex-col gap-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[12.5px] font-semibold text-[#0B0B0F]">
+                Live App URL
+              </span>
+              {deployment.livePublishing ? (
+                <span className="text-[11.5px] text-[#6D4AFF] font-medium">
+                  Generating link...
+                </span>
+              ) : (
+                <span className="text-[11.5px] text-emerald-700 font-medium">
+                  Ready in browser
+                </span>
+              )}
+            </div>
+            {deployment.liveUrl && (
+              <div className="rounded-xl border border-black/[0.09] bg-[#FAFAFC] px-3 py-2 flex items-center gap-2">
+                <span className="font-mono text-[12px] text-[#0B0B0F] truncate flex-1 select-all">
+                  {deployment.liveUrl}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void handleCopyLiveUrl()}
+                  aria-label="Copy live URL"
+                  className="min-h-[36px] px-2.5 rounded-lg border border-black/[0.1] bg-white hover:bg-black/[0.03] text-[12px] font-medium text-[#0B0B0F] inline-flex items-center gap-1 shrink-0"
+                >
+                  {copiedLiveUrl ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>Copied</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy</span>
+                    </>
+                  )}
+                </button>
+                <a
+                  href={deployment.liveUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Open live URL in browser"
+                  className="min-h-[36px] px-2.5 rounded-lg bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-[12px] font-medium inline-flex items-center gap-1 shrink-0"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Open</span>
+                </a>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* App Slug Input */}
         <div>

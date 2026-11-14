@@ -1,5 +1,9 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import {
+  deriveServerSessionTitle,
+  sanitizeSessionTitle,
+} from '../_appsStore.js';
+import {
   calculateBuildCreditsForBytes,
   commitGenerationCredits,
   getCreditExhaustionInfo,
@@ -895,9 +899,15 @@ function mergeParsedDbTables(...lists: ParsedDbTable[][]): ParsedDbTable[] {
   return Array.from(merged.values());
 }
 
+function extractSessionTitleFromRaw(raw: string): string {
+  const match = /\[\[\s*TITLE\s*:\s*([^\]]+?)\s*\]\]/i.exec(raw);
+  return match ? sanitizeSessionTitle(match[1]) : '';
+}
+
 function stripTagMarkers(text: string): string {
   return text
-    .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
+    .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*TITLE\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*DB_SCHEMA\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '');
@@ -1404,9 +1414,19 @@ export async function POST(request: Request): Promise<Response> {
 
         const previewSummary = extractPreviewStructureSummary(previousHtml);
 
+        const shouldGenerateTitle =
+          history.length === 0 || Boolean((options as { needsTitle?: boolean }).needsTitle);
+        const titleRuleForBuild = shouldGenerateTitle
+          ? 'STEP 00 (Short Session Title): Output a single tag `[[TITLE: <Short 2-4 Word App Title>]]` at the very start summarizing the user goal concisely (e.g. `[[TITLE: TikTok Clone]]`, `[[TITLE: WhatsApp Messenger]]`, `[[TITLE: Sneaker Storefront]]`) before your PLAN lines.'
+          : '';
+        const titleRuleForChat = shouldGenerateTitle
+          ? 'SESSION TITLE LINE: Output a single tag `[[TITLE: <Short 2-4 Word Topic Title>]]` at the very beginning summarizing this conversation concisely (e.g. `[[TITLE: Marketing Strategy Plan]]`, `[[TITLE: App Idea Brainstorm]]`), followed by a newline and your helpful conversational reply.'
+          : '';
+
         const buildRulesBlock = [
           'CALM ARCHITECTURAL DISCIPLINE — DO NOT RUSH INTO CODE:',
           'Before writing any HTML, slow down and think carefully like a senior product architect & monetization strategist:',
+          titleRuleForBuild,
           'STEP 0 (Architectural Planning & Structured Database Lines): Output 4 short planning lines using exact format `[[PLAN: <step>]]` covering:',
           '  1) `[[PLAN: Color palette & typography — ...]]` (choose a refined, harmonious color palette, high-contrast surfaces, crisp font hierarchy)',
           '  2) `[[PLAN: Layout & button placement — ...]]` (plan clean visual structure, thumb-friendly 44px+ buttons, intuitive header & bottom nav placement, balanced spacing)',
@@ -1431,7 +1451,9 @@ export async function POST(request: Request): Promise<Response> {
           '<Short, specific, immediately tappable upgrade prompt 2>',
           '<Short, specific, immediately tappable upgrade prompt 3>',
           '[[/SUGGESTIONS]]',
-        ].join('\n');
+        ]
+          .filter(Boolean)
+          .join('\n');
 
         let systemInstruction = '';
 
@@ -1444,6 +1466,7 @@ export async function POST(request: Request): Promise<Response> {
             previewSummary
               ? `\nContext about the user's current Preview app (for answering questions accurately without rebuilding):\n${previewSummary}`
               : '',
+            titleRuleForChat,
             'Respond directly and conversationally in real time to the user message.',
             'The user is chatting or asking a question right now — reply naturally without rebuilding the app or outputting HTML code.',
             'If asked about project Secrets or API keys, inspect the configured Secret keys & detected types above, name the exact key(s) you see (e.g. SUPABASE_URL / MY_SUPABASE), and confirm whether everything needed is present or which exact key should be added in the Secrets button.',
@@ -1478,7 +1501,7 @@ export async function POST(request: Request): Promise<Response> {
             'THINK FIRST BEFORE RESPONDING:',
             'First decide carefully whether the user message is:',
             '(A) CHAT / QUESTION: A question, greeting, explanation request, feedback discussion, or normal conversation (even if an app was already built in Preview).',
-            '    -> Start your output on the VERY FIRST LINE with exactly `[[INTENT:CHAT]]` followed by a newline, then write a natural, helpful conversational reply. Do NOT output HTML, code blocks, or rebuild the app.',
+            `    -> Start your output on the VERY FIRST LINE with exactly \`[[INTENT:CHAT]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, then write a natural, helpful conversational reply. Do NOT output HTML, code blocks, or rebuild the app.`,
             '(B) BUILD / EDIT APP: A request to create/build a new app or website, OR a request to change, cut, remove, fix, or add something in the Preview app.',
             '    -> Start your output on the VERY FIRST LINE with exactly `[[INTENT:BUILD]]` followed by a newline, then output TWO strictly separated parts:',
             buildRulesBlock,
@@ -1540,6 +1563,7 @@ export async function POST(request: Request): Promise<Response> {
         let emittedPlanSteps: string[] = [];
         let emittedDbSignature = '';
         let emittedDbTables: ParsedDbTable[] = [];
+        let emittedTitle = '';
         let lastProgressSentAt = 0;
         let buildCreditsEmitted = 0;
         let lastCreditEmitAt = 0;
@@ -1590,6 +1614,7 @@ export async function POST(request: Request): Promise<Response> {
           emittedPlanSteps = [];
           emittedDbSignature = '';
           emittedDbTables = [];
+          emittedTitle = '';
           lastProgressSentAt = 0;
           buildCreditsEmitted = 0;
           lastCreditEmitAt = 0;
@@ -1597,6 +1622,14 @@ export async function POST(request: Request): Promise<Response> {
         };
 
         const syncLivePlanSteps = (rawSoFar: string) => {
+          if (shouldGenerateTitle && !emittedTitle) {
+            const parsedTitle = extractSessionTitleFromRaw(rawSoFar);
+            if (parsedTitle) {
+              emittedTitle = parsedTitle;
+              sendEvent({ type: 'title', title: parsedTitle });
+            }
+          }
+
           const steps = extractPlanStepsFromRaw(rawSoFar);
           for (const step of steps) {
             if (!emittedPlanSteps.includes(step)) {
@@ -1751,8 +1784,20 @@ export async function POST(request: Request): Promise<Response> {
 
           if (resolvedKind === 'chat') {
             if (initialRoute === 'chat') {
-              sendEvent({ type: 'delta', text: bodyChunk });
-              emittedProseLength += bodyChunk.length;
+              const trimmedStart = fullRaw.trimStart();
+              if (
+                emittedProseLength === 0 &&
+                (trimmedStart.length === 0 || trimmedStart.startsWith('['))
+              ) {
+                const titleDone = /\[\[\s*TITLE\s*:[^\]]+\]\]/i.test(fullRaw);
+                const notTag =
+                  trimmedStart.length >= 2 && !trimmedStart.startsWith('[[');
+                if (titleDone || notTag || fullRaw.length > 90) {
+                  emitCleanProseRange(fullRaw.length);
+                }
+                return;
+              }
+              emitCleanProseRange(fullRaw.length);
               return;
             }
 
@@ -1844,7 +1889,6 @@ export async function POST(request: Request): Promise<Response> {
           }
           if (
             resolvedKind === 'chat' &&
-            initialRoute === 'auto' &&
             emittedProseLength < fullRaw.length &&
             !findCodeStart(fullRaw)
           ) {
@@ -2172,12 +2216,23 @@ export async function POST(request: Request): Promise<Response> {
                   'Your remaining credits reached 0 during building. Building is paused with all progress saved until credits reset or you upgrade.',
               };
 
+          const finalTitle =
+            emittedTitle ||
+            (shouldGenerateTitle
+              ? deriveServerSessionTitle(message, mode, partialHtml)
+              : undefined);
+          if (finalTitle && finalTitle !== emittedTitle) {
+            emittedTitle = finalTitle;
+            sendEvent({ type: 'title', title: finalTitle });
+          }
+
           const finalInfo = resolveModelInfo(modelUsed || requestedModel || 'openrouter/auto', catalog);
           sendEvent({
             type: 'paused',
             reason: exhaustInfo.code,
             message: exhaustInfo.error,
             kind: 'build',
+            title: finalTitle,
             fullText:
               partialProse ||
               'Build progress was automatically saved right when your remaining tokens ran out.',
@@ -2252,6 +2307,16 @@ export async function POST(request: Request): Promise<Response> {
           }
         }
 
+        const finalTitle =
+          emittedTitle ||
+          (shouldGenerateTitle
+            ? deriveServerSessionTitle(message, mode, previewHtml)
+            : undefined);
+        if (finalTitle && finalTitle !== emittedTitle) {
+          emittedTitle = finalTitle;
+          sendEvent({ type: 'title', title: finalTitle });
+        }
+
         const rawCreditsUsed =
           resolvedKind === 'build' && (previewHtml.length > 0 || finalFiles.length > 0)
             ? Math.max(1, calculateBuildCreditsForBytes(previewHtml.length))
@@ -2273,6 +2338,7 @@ export async function POST(request: Request): Promise<Response> {
         sendEvent({
           type: 'done',
           kind: resolvedKind,
+          title: finalTitle,
           fullText: finalProse,
           previewHtml,
           allFiles: finalFiles,

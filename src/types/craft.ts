@@ -100,6 +100,9 @@ export interface ProjectDatabaseConfig {
 export interface ProjectDeploymentConfig {
   status: 'draft' | 'deployed';
   slug: string;
+  appId?: string;
+  liveUrl?: string;
+  livePublishing?: boolean;
   version: number;
   deployedAt: string | null;
   environment: 'production' | 'preview';
@@ -117,6 +120,7 @@ export interface ComposerOptions {
   secretHints?: ProjectSecretHint[];
   databaseTables?: string[];
   clientCreditsRemaining?: number;
+  needsTitle?: boolean;
 }
 
 export interface BuilderTurn {

@@ -30,6 +30,10 @@
       "destination": "/api/:match*"
     },
     {
+      "source": "/app/:id",
+      "destination": "/api/apps?id=:id"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }

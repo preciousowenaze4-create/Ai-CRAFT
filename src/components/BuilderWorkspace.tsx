@@ -12,10 +12,12 @@ import {
   Copy,
   Database,
   Eye,
+  ExternalLink,
   Globe,
   HelpCircle,
   KeyRound,
   Lightbulb,
+  Link2,
   Loader2,
   MoreVertical,
   Paperclip,
@@ -75,6 +77,7 @@ function formatBuildStepLabel(filePath: string): string {
 function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
   const cleaned = raw
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
+    .replace(/\[\[\s*TITLE\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*DB_SCHEMA\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '');
@@ -194,6 +197,7 @@ export function BuilderWorkspace({
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [previewKey, setPreviewKey] = useState(0);
   const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedLiveUrl, setCopiedLiveUrl] = useState(false);
   const [activeCodeTab, setActiveCodeTab] = useState<'index.html' | 'styles.css' | 'app.js'>('index.html');
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -270,8 +274,12 @@ export function BuilderWorkspace({
   const narratedTurnIdsRef = useRef<Set<string>>(new Set());
   const prevProjectIdRef = useRef<string | null>(null);
 
-  const latestPreviewHtml =
-    [...turns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+  const latestBuiltTurn = useMemo(
+    () => [...turns].reverse().find((t) => Boolean(t.previewHtml)),
+    [turns]
+  );
+  const latestBuiltTurnId = latestBuiltTurn?.id ?? null;
+  const latestPreviewHtml = latestBuiltTurn?.previewHtml ?? '';
   const hasBuiltApp = latestPreviewHtml.length > 0;
 
   const codeParts = useMemo(() => {
@@ -1004,24 +1012,36 @@ export function BuilderWorkspace({
   };
 
   const handleShare = async (): Promise<string> => {
+    const shareUrl = deployment.liveUrl || window.location.href;
     const shareText = `${projectTitle} — Built with AI Craft`;
     try {
       if (navigator.share) {
         await navigator.share({
           title: projectTitle,
           text: shareText,
-          url: window.location.href,
+          url: shareUrl,
         });
         return 'Shared successfully';
       }
       if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(window.location.href);
-        return 'App link copied';
+        await navigator.clipboard.writeText(shareUrl);
+        return 'Live app link copied';
       }
     } catch {
       // User cancelled share or clipboard blocked
     }
     return 'Ready to share';
+  };
+
+  const handleCopyLiveUrl = async () => {
+    if (!deployment.liveUrl) return;
+    try {
+      await navigator.clipboard.writeText(deployment.liveUrl);
+      setCopiedLiveUrl(true);
+      window.setTimeout(() => setCopiedLiveUrl(false), 2000);
+    } catch {
+      // ignore clipboard restriction
+    }
   };
 
   const handleCopyCode = async () => {
@@ -1697,6 +1717,66 @@ export function BuilderWorkspace({
                             </span>
                           )}
                         </div>
+
+                        {stepBuildingDone &&
+                          Boolean(turn.previewHtml) &&
+                          turn.id === latestBuiltTurnId &&
+                          (deployment.liveUrl || deployment.livePublishing) && (
+                            <div className="mt-1.5 pt-3 border-t border-black/[0.06] flex flex-col gap-2">
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-1.5 text-[12.5px] font-semibold text-[#0B0B0F]">
+                                  <Link2 className="w-3.5 h-3.5 text-[#6D4AFF] shrink-0" />
+                                  <span>Live App Link</span>
+                                </div>
+                                {deployment.livePublishing ? (
+                                  <span className="inline-flex items-center gap-1 text-[11.5px] text-[#71717A]">
+                                    <Loader2 className="w-3 h-3 animate-spin text-[#6D4AFF]" />
+                                    <span>Generating link...</span>
+                                  </span>
+                                ) : deployment.version > 0 ? (
+                                  <span className="text-[11.5px] font-medium text-emerald-700 tabular-nums">
+                                    Live · v{deployment.version}
+                                  </span>
+                                ) : null}
+                              </div>
+
+                              {deployment.liveUrl && (
+                                <div className="rounded-xl border border-black/[0.09] bg-white px-3 py-2 flex items-center gap-2">
+                                  <span className="font-mono text-[12px] text-[#0B0B0F] truncate flex-1 select-all">
+                                    {deployment.liveUrl}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleCopyLiveUrl()}
+                                    aria-label="Copy live app link"
+                                    className="min-h-[36px] px-2.5 rounded-lg border border-black/[0.1] bg-[#FAFAFC] hover:bg-black/[0.04] text-[12px] font-medium text-[#0B0B0F] inline-flex items-center gap-1 shrink-0 active:scale-95 transition-all"
+                                  >
+                                    {copiedLiveUrl ? (
+                                      <>
+                                        <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                        <span>Copied</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy className="w-3.5 h-3.5" />
+                                        <span>Copy</span>
+                                      </>
+                                    )}
+                                  </button>
+                                  <a
+                                    href={deployment.liveUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    aria-label="Open live app in new browser tab"
+                                    className="min-h-[36px] px-2.5 rounded-lg bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-[12px] font-medium inline-flex items-center gap-1 shrink-0 active:scale-95 transition-all"
+                                  >
+                                    <ExternalLink className="w-3.5 h-3.5" />
+                                    <span>Open</span>
+                                  </a>
+                                </div>
+                              )}
+                            </div>
+                          )}
                       </div>
                     </div>
                   )}

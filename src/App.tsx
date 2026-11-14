@@ -25,6 +25,11 @@ import { TopBar } from './components/TopBar';
 import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
 import { buildProjectSecretHints } from './utils/secretHints';
 import {
+  deriveSmartProjectTitle,
+  sanitizeSessionTitle,
+  slugifyAppTitle,
+} from './utils/sessionTitle';
+import {
   AuthUser,
   BillingSummary,
   BuildMode,
@@ -153,12 +158,45 @@ function mergeIncomingDbSchema(
   };
 }
 
+function deriveLegacyTitle(promptText: string, mode: BuildMode): string {
+  const cleaned = promptText
+    .replace(/^(build|create|make|design)\s+(me\s+)?(an?|the)\s+/i, '')
+    .trim();
+  const words = cleaned.split(/\s+/).filter(Boolean).slice(0, 3);
+  if (words.length === 0) {
+    return mode === 'mobile' ? 'AICraft Mobile' : 'AICraft Web';
+  }
+  const title = words
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+  return title.length > 24 ? `${title.slice(0, 24)}…` : title;
+}
+
+function normalizeProjectTitle(proj: CraftProject): CraftProject {
+  const firstPrompt = proj.turns?.[0]?.userMessage;
+  if (!firstPrompt) return proj;
+  const legacyTitle = deriveLegacyTitle(firstPrompt, proj.mode);
+  const needsUpgrade =
+    !proj.title ||
+    proj.title === legacyTitle ||
+    /^(?:app|website|site|platform)\s+(?:like|similar|for)\b/i.test(proj.title);
+  if (!needsUpgrade) return proj;
+  const smart = deriveSmartProjectTitle(firstPrompt, proj.mode);
+  if (!smart || smart === proj.title) return proj;
+  return {
+    ...proj,
+    title: smart,
+  };
+}
+
 function loadSavedProjects(): CraftProject[] {
   try {
     const raw = window.localStorage.getItem(STORAGE_PROJECTS_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as CraftProject[]) : [];
+    return Array.isArray(parsed)
+      ? (parsed as CraftProject[]).map(normalizeProjectTitle)
+      : [];
   } catch {
     return [];
   }
@@ -201,20 +239,6 @@ function saveProjectsSafely(projects: CraftProject[]) {
       // Ignore storage quota failure gracefully
     }
   }
-}
-
-function deriveProjectTitle(promptText: string, mode: BuildMode): string {
-  const cleaned = promptText
-    .replace(/^(build|create|make|design)\s+(me\s+)?(an?|the)\s+/i, '')
-    .trim();
-  const words = cleaned.split(/\s+/).filter(Boolean).slice(0, 3);
-  if (words.length === 0) {
-    return mode === 'mobile' ? 'AICraft Mobile' : 'AICraft Web';
-  }
-  const title = words
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(' ');
-  return title.length > 24 ? `${title.slice(0, 24)}…` : title;
 }
 
 function loadSavedCredits(): number {
@@ -322,7 +346,7 @@ function mergeProjectsFromCloud(
       });
     }
   }
-  return Array.from(mergedMap.values());
+  return Array.from(mergedMap.values()).map(normalizeProjectTitle);
 }
 
 const CLIENT_BYTES_PER_BUILD_CREDIT = 1350;
@@ -903,6 +927,167 @@ export default function App() {
     []
   );
 
+  const updateProjectTitle = useCallback((projectId: string, rawTitle: string) => {
+    const clean = sanitizeSessionTitle(rawTitle);
+    if (!clean) return;
+    const nextSlug = slugifyAppTitle(clean);
+    setProjects((prev) =>
+      prev.map((proj) => {
+        if (proj.id !== projectId) return proj;
+        const nextDeployment = proj.deployment
+          ? proj.deployment.status === 'draft'
+            ? { ...proj.deployment, slug: nextSlug }
+            : proj.deployment
+          : undefined;
+        return {
+          ...proj,
+          title: clean,
+          ...(nextDeployment ? { deployment: nextDeployment } : {}),
+        };
+      })
+    );
+  }, []);
+
+  const publishProjectLive = useCallback(
+    async (
+      projectId: string,
+      html: string,
+      overrides?: {
+        title?: string;
+        slug?: string;
+        customAppId?: string;
+        forceBump?: boolean;
+      }
+    ) => {
+      const trimmedHtml = html.trim();
+      if (!trimmedHtml) return;
+
+      const proj = projectsRef.current.find((p) => p.id === projectId);
+      if (!proj) return;
+
+      const resolvedTitle =
+        sanitizeSessionTitle(overrides?.title || '') ||
+        proj.title ||
+        'AI Craft App';
+      const resolvedSlug = slugifyAppTitle(
+        overrides?.slug || proj.deployment?.slug || resolvedTitle
+      );
+      const shortSuffix =
+        proj.id.replace(/[^a-z0-9]/gi, '').slice(-5).toLowerCase() || 'app';
+      const targetAppId = overrides?.customAppId
+        ? slugifyAppTitle(overrides.customAppId)
+        : proj.deployment?.appId || `${resolvedSlug}-${shortSuffix}`;
+      const nextVersion = Math.max(1, (proj.deployment?.version ?? 0) + 1);
+
+      setProjects((prev) =>
+        prev.map((p) => {
+          if (p.id !== projectId) return p;
+          return {
+            ...p,
+            deployment: {
+              status: p.deployment?.status ?? 'draft',
+              slug: p.deployment?.slug || resolvedSlug,
+              appId: p.deployment?.appId || targetAppId,
+              liveUrl: p.deployment?.liveUrl,
+              livePublishing: true,
+              version: p.deployment?.version ?? 0,
+              deployedAt: p.deployment?.deployedAt ?? null,
+              environment: 'production',
+            },
+          };
+        })
+      );
+
+      const publicEnv: Record<string, string> = {};
+      for (const secret of proj.secrets ?? []) {
+        if (secret.key && secret.value) {
+          publicEnv[secret.key] = secret.value;
+        }
+      }
+
+      try {
+        const res = await fetch('/api/apps', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...getStoredAuthHeaders(),
+          },
+          body: JSON.stringify({
+            appId: targetAppId,
+            projectId: proj.id,
+            title: resolvedTitle,
+            slug: resolvedSlug,
+            mode: proj.mode,
+            html: trimmedHtml,
+            publicEnv,
+            tables: (proj.databaseConfig?.tables ?? []).map((t) => t.name),
+            version: overrides?.forceBump ? nextVersion : nextVersion,
+          }),
+        });
+
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          appId?: string;
+          slug?: string;
+          path?: string;
+          version?: number;
+          deployedAt?: string;
+        };
+
+        if (res.ok && data.ok && data.path) {
+          const liveUrl = `${window.location.origin}${data.path}`;
+          const finalAppId = data.appId || targetAppId;
+          const finalSlug = data.slug || resolvedSlug;
+          const deployedAt = data.deployedAt || new Date().toISOString();
+          const version =
+            typeof data.version === 'number' && data.version > 0
+              ? data.version
+              : nextVersion;
+
+          setPublishedProjects((prev) => ({
+            ...prev,
+            [projectId]: true,
+          }));
+          setProjects((prev) =>
+            prev.map((p) => {
+              if (p.id !== projectId) return p;
+              return {
+                ...p,
+                deployment: {
+                  status: 'deployed',
+                  slug: finalSlug,
+                  appId: finalAppId,
+                  liveUrl,
+                  livePublishing: false,
+                  version,
+                  deployedAt,
+                  environment: 'production',
+                },
+              };
+            })
+          );
+        } else {
+          setProjects((prev) =>
+            prev.map((p) =>
+              p.id === projectId && p.deployment
+                ? { ...p, deployment: { ...p.deployment, livePublishing: false } }
+                : p
+            )
+          );
+        }
+      } catch {
+        setProjects((prev) =>
+          prev.map((p) =>
+            p.id === projectId && p.deployment
+              ? { ...p, deployment: { ...p.deployment, livePublishing: false } }
+              : p
+          )
+        );
+      }
+    },
+    []
+  );
+
   const adjustLocalCredits = useCallback((delta: number) => {
     if (delta === 0) return;
     setCredits((prev) => Math.max(0, prev + delta));
@@ -1059,6 +1244,7 @@ export default function App() {
                 pausedMessage?: string;
                 pausedAt?: string;
                 thoughtSeconds?: number;
+                title?: string;
               };
 
               if (evt.type === 'job' && evt.jobId) {
@@ -1072,7 +1258,10 @@ export default function App() {
                   jobId: evt.jobId,
                   startedAt: typeof evt.startedAt === 'number' ? evt.startedAt : t.startedAt,
                 }));
+              } else if (evt.type === 'title' && evt.title) {
+                updateProjectTitle(projectId, evt.title);
               } else if (evt.type === 'snapshot') {
+                if (evt.title) updateProjectTitle(projectId, evt.title);
                 flushBuffered();
                 if (typeof evt.startedAt === 'number') {
                   startedAt = evt.startedAt;
@@ -1259,6 +1448,9 @@ export default function App() {
                 stopCreditTicker();
                 flushBuffered();
                 const finalKind = evt.kind ?? currentTurnKind;
+                if (evt.title) {
+                  updateProjectTitle(projectId, evt.title);
+                }
                 const finalSeconds = Math.max(
                   1,
                   Math.round(
@@ -1302,6 +1494,17 @@ export default function App() {
                     modelProvider: evt.provider ?? t.modelProvider,
                   };
                 });
+                const builtHtmlForLink =
+                  evt.previewHtml ||
+                  projectsRef.current
+                    .find((p) => p.id === projectId)
+                    ?.turns.find((t) => t.id === turnId)?.previewHtml ||
+                  '';
+                if (builtHtmlForLink) {
+                  void publishProjectLive(projectId, builtHtmlForLink, {
+                    title: evt.title,
+                  });
+                }
                 if (Array.isArray(evt.dbTables) && evt.dbTables.length > 0) {
                   const doneTables = evt.dbTables;
                   setProjects((prev) =>
@@ -1373,6 +1576,9 @@ export default function App() {
                 sawTerminalEvent = true;
                 stopCreditTicker();
                 flushBuffered();
+                if (evt.title) {
+                  updateProjectTitle(projectId, evt.title);
+                }
                 const pauseSeconds = Math.max(
                   1,
                   Math.round(
@@ -1517,7 +1723,9 @@ export default function App() {
       adjustLocalCredits,
       applyBillingSummary,
       notificationsEnabled,
+      publishProjectLive,
       syncBillingFromServer,
+      updateProjectTitle,
       updateTurn,
     ]
   );
@@ -1815,7 +2023,11 @@ export default function App() {
                   errorMessage?: string;
                   pausedReason?: BuilderTurn['pausedReason'];
                   pausedMessage?: string;
+                  title?: string;
                 };
+                if (snap.title) {
+                  updateProjectTitle(proj.id, snap.title);
+                }
                 if (
                   snap.status === 'complete' ||
                   snap.status === 'paused' ||
@@ -1865,6 +2077,11 @@ export default function App() {
                         ? t.pausedAt ?? new Date().toISOString()
                         : t.pausedAt,
                   }));
+                  if (snap.status === 'complete' && snap.previewHtml) {
+                    void publishProjectLive(proj.id, snap.previewHtml, {
+                      title: snap.title,
+                    });
+                  }
                   if (snap.status === 'paused') {
                     void syncBillingFromServer();
                   }
@@ -1915,7 +2132,21 @@ export default function App() {
       window.removeEventListener('pagehide', handlePageHide);
       window.removeEventListener('online', handleOnline);
     };
-  }, [syncBillingFromServer, updateTurn]);
+  }, [publishProjectLive, syncBillingFromServer, updateProjectTitle, updateTurn]);
+
+  // Automatically generate a live app link for any active built project missing one
+  const autoPublishedIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!activeProject) return;
+    if (isProjectWorking(activeProject)) return;
+    if (activeProject.deployment?.liveUrl || activeProject.deployment?.livePublishing) return;
+    if (autoPublishedIdsRef.current.has(activeProject.id)) return;
+    const builtHtml =
+      [...activeProject.turns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+    if (!builtHtml) return;
+    autoPublishedIdsRef.current.add(activeProject.id);
+    void publishProjectLive(activeProject.id, builtHtml);
+  }, [activeProject, publishProjectLive]);
 
   const handleModeChange = (nextMode: BuildMode) => {
     if (nextMode === mode) return;
@@ -2003,7 +2234,7 @@ export default function App() {
 
     const newProject: CraftProject = {
       id: projectId,
-      title: deriveProjectTitle(trimmed, mode),
+      title: deriveSmartProjectTitle(trimmed, mode),
       mode,
       createdAt: new Date().toLocaleTimeString([], {
         hour: '2-digit',
@@ -2027,6 +2258,7 @@ export default function App() {
       {
         ...options,
         clientCreditsRemaining: credits,
+        needsTitle: true,
       },
       '',
       now
@@ -2569,10 +2801,17 @@ export default function App() {
               }));
             }}
             onPublish={() => {
+              const latestHtml =
+                [...activeProject.turns]
+                  .reverse()
+                  .find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
               setPublishedProjects((prev) => ({
                 ...prev,
                 [activeProject.id]: true,
               }));
+              if (latestHtml) {
+                void publishProjectLive(activeProject.id, latestHtml);
+              }
             }}
             onUpdateSecrets={(nextSecrets) => {
               setProjects((prev) =>
@@ -2593,27 +2832,41 @@ export default function App() {
               );
             }}
             onDeployProject={(slug) => {
-              const nowIso = new Date().toISOString();
-              setPublishedProjects((prev) => ({
-                ...prev,
-                [activeProject.id]: true,
-              }));
-              setProjects((prev) =>
-                prev.map((proj) => {
-                  if (proj.id !== activeProject.id) return proj;
-                  const prevVersion = proj.deployment?.version ?? 0;
-                  return {
-                    ...proj,
-                    deployment: {
-                      status: 'deployed',
-                      slug,
-                      version: prevVersion + 1,
-                      deployedAt: nowIso,
-                      environment: 'production',
-                    },
-                  };
-                })
-              );
+              const latestHtml =
+                [...activeProject.turns]
+                  .reverse()
+                  .find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+              if (latestHtml) {
+                void publishProjectLive(activeProject.id, latestHtml, {
+                  slug,
+                  customAppId: slug,
+                  forceBump: true,
+                });
+              } else {
+                const nowIso = new Date().toISOString();
+                setPublishedProjects((prev) => ({
+                  ...prev,
+                  [activeProject.id]: true,
+                }));
+                setProjects((prev) =>
+                  prev.map((proj) => {
+                    if (proj.id !== activeProject.id) return proj;
+                    const prevVersion = proj.deployment?.version ?? 0;
+                    return {
+                      ...proj,
+                      deployment: {
+                        status: 'deployed',
+                        slug,
+                        appId: proj.deployment?.appId,
+                        liveUrl: proj.deployment?.liveUrl,
+                        version: prevVersion + 1,
+                        deployedAt: nowIso,
+                        environment: 'production',
+                      },
+                    };
+                  })
+                );
+              }
               setInlineNotice(`${activeProject.title} deployed live`);
             }}
             onBack={() => {

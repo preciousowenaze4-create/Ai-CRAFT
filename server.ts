@@ -30,6 +30,16 @@ import {
   serializeBillingSummary,
   upgradeUserAccountFromTransaction,
 } from './api/_billing.js';
+import {
+  buildNotFoundAppHtml,
+  buildStandaloneAppHtml,
+  deriveServerSessionTitle,
+  filterPublicSafeEnv,
+  loadPublishedApp,
+  sanitizeAppId,
+  sanitizeSessionTitle,
+  savePublishedApp,
+} from './api/_appsStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1303,9 +1313,15 @@ function mergeParsedDbTables(...lists: ParsedDbTable[][]): ParsedDbTable[] {
   return Array.from(merged.values());
 }
 
+function extractSessionTitleFromRaw(raw: string): string {
+  const match = /\[\[\s*TITLE\s*:\s*([^\]]+?)\s*\]\]/i.exec(raw);
+  return match ? sanitizeSessionTitle(match[1]) : '';
+}
+
 function stripTagMarkers(text: string): string {
   return text
-    .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
+    .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*TITLE\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*DB_SCHEMA\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '');
@@ -1453,6 +1469,7 @@ interface CraftJob {
   startedAt: number;
   updatedAt: number;
   kind: 'chat' | 'build';
+  title?: string;
   phase: 'understanding' | 'building' | 'paused' | 'complete' | 'error';
   phaseLabel: string;
   modelId?: string;
@@ -1484,6 +1501,7 @@ function serializeJobSnapshot(job: CraftJob) {
     startedAt: job.startedAt,
     thoughtSeconds: Math.max(1, Math.round((job.updatedAt - job.startedAt) / 1000)),
     kind: job.kind,
+    title: job.title,
     phase: job.phase,
     phaseLabel: job.phaseLabel,
     modelId: job.modelId,
@@ -1532,7 +1550,9 @@ async function startServer() {
     job.updatedAt = Date.now();
     const type = typeof payload.type === 'string' ? payload.type : '';
 
-    if (type === 'meta') {
+    if (type === 'title' && typeof payload.title === 'string' && payload.title.trim()) {
+      job.title = payload.title.trim();
+    } else if (type === 'meta') {
       if (payload.kind === 'chat' || payload.kind === 'build') job.kind = payload.kind;
       if (typeof payload.modelId === 'string') job.modelId = payload.modelId;
       if (typeof payload.modelName === 'string') job.modelName = payload.modelName;
@@ -1564,6 +1584,7 @@ async function startServer() {
       if (typeof payload.bytesBuilt === 'number') job.bytesBuilt = payload.bytesBuilt;
     } else if (type === 'reset') {
       job.kind = 'chat';
+      job.title = undefined;
       job.phase = 'understanding';
       job.phaseLabel = 'Thinking...';
       job.aiText = '';
@@ -1581,6 +1602,9 @@ async function startServer() {
       job.phase = 'paused';
       job.kind = 'build';
       job.phaseLabel = 'Paused · 0 tokens left';
+      if (typeof payload.title === 'string' && payload.title.trim()) {
+        job.title = payload.title.trim();
+      }
       job.pausedReason =
         typeof payload.reason === 'string' ? payload.reason : 'MONTHLY_LIMIT_REACHED';
       job.pausedMessage =
@@ -1604,6 +1628,9 @@ async function startServer() {
       job.status = 'complete';
       job.phase = 'complete';
       if (payload.kind === 'chat' || payload.kind === 'build') job.kind = payload.kind;
+      if (typeof payload.title === 'string' && payload.title.trim()) {
+        job.title = payload.title.trim();
+      }
       job.phaseLabel = job.kind === 'chat' ? 'Answered' : 'Build complete';
       if (typeof payload.fullText === 'string') job.aiText = payload.fullText;
       if (typeof payload.previewHtml === 'string') job.previewHtml = payload.previewHtml;
@@ -2502,6 +2529,134 @@ async function startServer() {
     res.json({ synced: saved });
   });
 
+  app.get('/api/apps', async (req, res) => {
+    const rawId = typeof req.query.id === 'string' ? req.query.id : '';
+    const cleanId = sanitizeAppId(rawId);
+    if (!rawId || !cleanId) {
+      res.status(404).setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(buildNotFoundAppHtml(rawId || 'app'));
+      return;
+    }
+    const record = await loadPublishedApp(cleanId);
+    if (!record || !record.html) {
+      if (req.query.format === 'json') {
+        res.status(404).json({ exists: false, appId: cleanId });
+        return;
+      }
+      res.status(404).setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(buildNotFoundAppHtml(cleanId));
+      return;
+    }
+    if (req.query.format === 'json') {
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        exists: true,
+        appId: record.appId,
+        projectId: record.projectId,
+        title: record.title,
+        slug: record.slug,
+        mode: record.mode,
+        version: record.version,
+        updatedAt: record.updatedAt,
+      });
+      return;
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.send(buildStandaloneAppHtml(record));
+  });
+
+  app.get('/app/:id', async (req, res) => {
+    const cleanId = sanitizeAppId(req.params.id || '');
+    const record = await loadPublishedApp(cleanId);
+    if (!record || !record.html) {
+      res.status(404).setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(buildNotFoundAppHtml(cleanId));
+      return;
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.send(buildStandaloneAppHtml(record));
+  });
+
+  app.post('/api/apps', async (req, res) => {
+    const body = (req.body || {}) as {
+      appId?: string;
+      projectId?: string;
+      title?: string;
+      slug?: string;
+      mode?: 'mobile' | 'web';
+      html?: string;
+      publicEnv?: Record<string, string>;
+      tables?: string[];
+      version?: number;
+    };
+    const html = typeof body.html === 'string' ? body.html.trim() : '';
+    const projectId = typeof body.projectId === 'string' ? body.projectId.trim() : '';
+    if (!html || !projectId) {
+      res.status(400).json({ ok: false, error: 'Missing required html or projectId.' });
+      return;
+    }
+
+    const cookies = parseCookies(req.headers.cookie);
+    const authHeader = req.headers.authorization || '';
+    const bearerToken = /^bearer\s+/i.test(authHeader)
+      ? authHeader.replace(/^bearer\s+/i, '').trim()
+      : '';
+    const accessToken = bearerToken || cookies[SB_ACCESS_COOKIE] || '';
+    const refreshToken =
+      (typeof req.headers['x-refresh-token'] === 'string'
+        ? req.headers['x-refresh-token'].trim()
+        : '') ||
+      cookies[SB_REFRESH_COOKIE] ||
+      '';
+    const auth =
+      accessToken || refreshToken
+        ? await getAuthenticatedSupabaseUser(accessToken, refreshToken).catch(() => ({ user: null }))
+        : { user: null };
+
+    const slug = sanitizeAppId(body.slug || body.title || projectId);
+    let targetAppId = sanitizeAppId(body.appId || slug);
+    const existing = await loadPublishedApp(targetAppId);
+    if (
+      existing &&
+      existing.projectId !== projectId &&
+      (!auth.user || (existing.ownerId && existing.ownerId !== auth.user.id))
+    ) {
+      const suffix = projectId.replace(/[^a-z0-9]/gi, '').slice(-5).toLowerCase() || 'app';
+      targetAppId = sanitizeAppId(`${slug}-${suffix}`);
+    }
+
+    const nextVersion =
+      typeof body.version === 'number' && Number.isFinite(body.version) && body.version > 0
+        ? Math.floor(body.version)
+        : (existing?.version ?? 0) + 1;
+
+    const { record } = await savePublishedApp({
+      appId: targetAppId,
+      projectId,
+      ownerId: auth.user?.id || existing?.ownerId,
+      title: typeof body.title === 'string' && body.title.trim() ? body.title.trim() : 'AI Craft App',
+      slug,
+      mode: body.mode === 'web' ? 'web' : 'mobile',
+      html,
+      publicEnv: filterPublicSafeEnv(body.publicEnv),
+      tables: Array.isArray(body.tables) ? body.tables.filter((t) => typeof t === 'string') : [],
+      version: nextVersion,
+      updatedAt: new Date().toISOString(),
+    });
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ok: true,
+      appId: record.appId,
+      slug: record.slug,
+      path: `/app/${record.appId}`,
+      version: record.version,
+      deployedAt: record.updatedAt,
+    });
+  });
+
   app.get('/api/craft/jobs/:jobId', (req, res) => {
     const job = craftJobs.get(req.params.jobId);
     if (!job) {
@@ -2527,6 +2682,7 @@ async function startServer() {
         `data: ${JSON.stringify({
           type: 'done',
           kind: job.kind,
+          title: job.title,
           fullText: job.aiText,
           previewHtml: job.previewHtml,
           allFiles: job.files,
@@ -2551,6 +2707,7 @@ async function startServer() {
           reason: job.pausedReason || 'MONTHLY_LIMIT_REACHED',
           message: job.pausedMessage || 'Remaining credits finished during build.',
           kind: 'build',
+          title: job.title,
           fullText: job.aiText,
           previewHtml: job.previewHtml,
           allFiles: job.files,
@@ -2725,6 +2882,7 @@ async function startServer() {
         secretHints?: Array<{ key?: string; hint?: string }>;
         databaseTables?: string[];
         clientCreditsRemaining?: number;
+        needsTitle?: boolean;
       };
     };
 
@@ -2980,9 +3138,18 @@ async function startServer() {
 
       const previewSummary = extractPreviewStructureSummary(previousHtml);
 
+      const shouldGenerateTitle = history.length === 0 || Boolean(options.needsTitle);
+      const titleRuleForBuild = shouldGenerateTitle
+        ? 'STEP 00 (Short Session Title): Output a single tag `[[TITLE: <Short 2-4 Word App Title>]]` at the very start summarizing the user goal concisely (e.g. `[[TITLE: TikTok Clone]]`, `[[TITLE: WhatsApp Messenger]]`, `[[TITLE: Sneaker Storefront]]`) before your PLAN lines.'
+        : '';
+      const titleRuleForChat = shouldGenerateTitle
+        ? 'SESSION TITLE LINE: Output a single tag `[[TITLE: <Short 2-4 Word Topic Title>]]` at the very beginning summarizing this conversation concisely (e.g. `[[TITLE: Marketing Strategy Plan]]`, `[[TITLE: App Idea Brainstorm]]`), followed by a newline and your helpful conversational reply.'
+        : '';
+
       const buildRulesBlock = [
         'CALM ARCHITECTURAL DISCIPLINE — DO NOT RUSH INTO CODE:',
         'Before writing any HTML, slow down and think carefully like a senior product architect & monetization strategist:',
+        titleRuleForBuild,
         'STEP 0 (Architectural Planning & Structured Database Lines): Output 4 short planning lines using exact format `[[PLAN: <step>]]` covering:',
         '  1) `[[PLAN: Color palette & typography — ...]]` (choose a refined, harmonious color palette, high-contrast surfaces, crisp font hierarchy)',
         '  2) `[[PLAN: Layout & button placement — ...]]` (plan clean visual structure, thumb-friendly 44px+ buttons, intuitive header & bottom nav placement, balanced spacing)',
@@ -3007,7 +3174,9 @@ async function startServer() {
         '<Short, specific, immediately tappable upgrade prompt 2>',
         '<Short, specific, immediately tappable upgrade prompt 3>',
         '[[/SUGGESTIONS]]',
-      ].join('\n');
+      ]
+        .filter(Boolean)
+        .join('\n');
 
       let systemInstruction = '';
 
@@ -3020,6 +3189,7 @@ async function startServer() {
           previewSummary
             ? `\nContext about the user's current Preview app (for answering questions accurately without rebuilding):\n${previewSummary}`
             : '',
+          titleRuleForChat,
           'Respond directly and conversationally in real time to the user message.',
           'The user is chatting or asking a question right now — reply naturally without rebuilding the app or outputting HTML code.',
           'If asked about project Secrets or API keys, inspect the configured Secret keys & detected types above, name the exact key(s) you see (e.g. SUPABASE_URL / MY_SUPABASE), and confirm whether everything needed is present or which exact key should be added in the Secrets button.',
@@ -3054,7 +3224,7 @@ async function startServer() {
           'THINK FIRST BEFORE RESPONDING:',
           'First decide carefully whether the user message is:',
           '(A) CHAT / QUESTION: A question, greeting, explanation request, feedback discussion, or normal conversation (even if an app was already built in Preview).',
-          '    -> Start your output on the VERY FIRST LINE with exactly `[[INTENT:CHAT]]` followed by a newline, then write a natural, helpful conversational reply. Do NOT output HTML, code blocks, or rebuild the app.',
+          `    -> Start your output on the VERY FIRST LINE with exactly \`[[INTENT:CHAT]]\` followed by a newline${shouldGenerateTitle ? ', then `[[TITLE: <Short 2-4 Word Title>]]` followed by a newline' : ''}, then write a natural, helpful conversational reply. Do NOT output HTML, code blocks, or rebuild the app.`,
           '(B) BUILD / EDIT APP: A request to create/build a new app or website, OR a request to change, cut, remove, fix, or add something in the Preview app.',
           '    -> Start your output on the VERY FIRST LINE with exactly `[[INTENT:BUILD]]` followed by a newline, then output TWO strictly separated parts:',
           buildRulesBlock,
@@ -3116,6 +3286,7 @@ async function startServer() {
       let emittedPlanSteps: string[] = [];
       let emittedDbSignature = '';
       let emittedDbTables: ParsedDbTable[] = [];
+      let emittedTitle = '';
       let lastProgressSentAt = 0;
       let buildCreditsEmitted = 0;
       let lastCreditEmitAt = 0;
@@ -3154,6 +3325,7 @@ async function startServer() {
         emittedPlanSteps = [];
         emittedDbSignature = '';
         emittedDbTables = [];
+        emittedTitle = '';
         lastProgressSentAt = 0;
         buildCreditsEmitted = 0;
         lastCreditEmitAt = 0;
@@ -3161,6 +3333,14 @@ async function startServer() {
       };
 
       const syncLivePlanSteps = (rawSoFar: string) => {
+        if (shouldGenerateTitle && !emittedTitle) {
+          const parsedTitle = extractSessionTitleFromRaw(rawSoFar);
+          if (parsedTitle) {
+            emittedTitle = parsedTitle;
+            sendEvent({ type: 'title', title: parsedTitle });
+          }
+        }
+
         const steps = extractPlanStepsFromRaw(rawSoFar);
         for (const step of steps) {
           if (!emittedPlanSteps.includes(step)) {
@@ -3316,8 +3496,20 @@ async function startServer() {
 
         if (resolvedKind === 'chat') {
           if (initialRoute === 'chat') {
-            sendEvent({ type: 'delta', text: bodyChunk });
-            emittedProseLength += bodyChunk.length;
+            const trimmedStart = fullRaw.trimStart();
+            if (
+              emittedProseLength === 0 &&
+              (trimmedStart.length === 0 || trimmedStart.startsWith('['))
+            ) {
+              const titleDone = /\[\[\s*TITLE\s*:[^\]]+\]\]/i.test(fullRaw);
+              const notTag =
+                trimmedStart.length >= 2 && !trimmedStart.startsWith('[[');
+              if (titleDone || notTag || fullRaw.length > 90) {
+                emitCleanProseRange(fullRaw.length);
+              }
+              return;
+            }
+            emitCleanProseRange(fullRaw.length);
             return;
           }
 
@@ -3406,7 +3598,6 @@ async function startServer() {
         }
         if (
           resolvedKind === 'chat' &&
-          initialRoute === 'auto' &&
           emittedProseLength < fullRaw.length &&
           !findCodeStart(fullRaw)
         ) {
@@ -3744,12 +3935,23 @@ async function startServer() {
                 'Your remaining credits reached 0 during building. Building is paused with all progress saved until credits reset or you upgrade.',
             };
 
+        const finalTitle =
+          emittedTitle ||
+          (shouldGenerateTitle
+            ? deriveServerSessionTitle(message, mode, partialHtml)
+            : undefined);
+        if (finalTitle && finalTitle !== emittedTitle) {
+          emittedTitle = finalTitle;
+          sendEvent({ type: 'title', title: finalTitle });
+        }
+
         const finalInfo = resolveModelInfo(modelUsed || requestedModel || 'openrouter/auto');
         sendEvent({
           type: 'paused',
           reason: exhaustInfo.code,
           message: exhaustInfo.error,
           kind: 'build',
+          title: finalTitle,
           fullText:
             partialProse ||
             'Build progress was automatically saved right when your remaining tokens ran out.',
@@ -3824,6 +4026,16 @@ async function startServer() {
         }
       }
 
+      const finalTitle =
+        emittedTitle ||
+        (shouldGenerateTitle
+          ? deriveServerSessionTitle(message, mode, previewHtml)
+          : undefined);
+      if (finalTitle && finalTitle !== emittedTitle) {
+        emittedTitle = finalTitle;
+        sendEvent({ type: 'title', title: finalTitle });
+      }
+
       const rawCreditsUsed =
         resolvedKind === 'build' && (previewHtml.length > 0 || finalFiles.length > 0)
           ? Math.max(1, calculateBuildCreditsForBytes(previewHtml.length))
@@ -3846,6 +4058,7 @@ async function startServer() {
       sendEvent({
         type: 'done',
         kind: resolvedKind,
+        title: finalTitle,
         fullText: finalProse,
         previewHtml,
         allFiles: finalFiles,
