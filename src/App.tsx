@@ -33,7 +33,9 @@ import {
   NavTab,
   OpenRouterModel,
   PaymentTransaction,
+  ProjectDatabaseColumn,
   ProjectDatabaseConfig,
+  ProjectDatabaseTable,
   ProjectDeploymentConfig,
   ProjectSecret,
   TurnKind,
@@ -80,6 +82,74 @@ function isProjectWorking(project: CraftProject | null | undefined): boolean {
       (t) => t.phase === 'understanding' || t.phase === 'building'
     )
   );
+}
+
+interface IncomingSchemaTable {
+  name: string;
+  columns: Array<{
+    name: string;
+    type: ProjectDatabaseColumn['type'];
+    required?: boolean;
+  }>;
+}
+
+function mergeIncomingDbSchema(
+  existing: ProjectDatabaseConfig | undefined,
+  incoming: IncomingSchemaTable[]
+): ProjectDatabaseConfig {
+  const base: ProjectDatabaseConfig = existing ?? {
+    enabled: true,
+    providerLabel: 'Cloud & Local App Store',
+    tables: [],
+  };
+  if (!Array.isArray(incoming) || incoming.length === 0) return base;
+
+  const tableMap = new Map<string, ProjectDatabaseTable>();
+  for (const tbl of base.tables) {
+    tableMap.set(tbl.name, {
+      ...tbl,
+      columns: [...tbl.columns],
+    });
+  }
+
+  for (const item of incoming) {
+    const cleanName = item.name?.trim().toLowerCase();
+    if (!cleanName) continue;
+    const cols: ProjectDatabaseColumn[] = (item.columns || []).map((c) => ({
+      name: c.name,
+      type:
+        c.type === 'number' ||
+        c.type === 'boolean' ||
+        c.type === 'timestamp' ||
+        c.type === 'json'
+          ? c.type
+          : 'text',
+      required: Boolean(c.required),
+    }));
+    const current = tableMap.get(cleanName);
+    if (!current) {
+      tableMap.set(cleanName, {
+        id: `tbl-${Date.now()}-${cleanName}`,
+        name: cleanName,
+        columns: cols,
+      });
+    } else {
+      const seen = new Set(current.columns.map((c) => c.name));
+      for (const col of cols) {
+        if (!seen.has(col.name)) {
+          seen.add(col.name);
+          current.columns.push(col);
+        }
+      }
+    }
+  }
+
+  return {
+    ...base,
+    enabled: true,
+    tables: Array.from(tableMap.values()),
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function loadSavedProjects(): CraftProject[] {
@@ -915,6 +985,8 @@ export default function App() {
                 allSteps?: string[];
                 planSteps?: string[];
                 suggestions?: string[];
+                tables?: IncomingSchemaTable[];
+                dbTables?: IncomingSchemaTable[];
                 bytesBuilt?: number;
                 used?: number;
                 targetUsed?: number;
@@ -948,6 +1020,21 @@ export default function App() {
                 if (evt.kind) currentTurnKind = evt.kind;
                 if (evt.phase) currentTurnPhase = evt.phase;
                 if (typeof evt.bytesBuilt === 'number') latestBytesBuilt = evt.bytesBuilt;
+                if (Array.isArray(evt.dbTables) && evt.dbTables.length > 0) {
+                  setProjects((prev) =>
+                    prev.map((p) =>
+                      p.id === projectId
+                        ? {
+                            ...p,
+                            databaseConfig: mergeIncomingDbSchema(
+                              p.databaseConfig,
+                              evt.dbTables!
+                            ),
+                          }
+                        : p
+                    )
+                  );
+                }
                 updateTurn(projectId, turnId, (t) => ({
                   ...t,
                   jobId: evt.jobId ?? t.jobId,
@@ -1007,6 +1094,24 @@ export default function App() {
                   ...t,
                   planSteps: evt.allSteps,
                 }));
+              } else if (evt.type === 'schema' && Array.isArray(evt.tables)) {
+                const incomingTables = evt.tables;
+                setProjects((prev) =>
+                  prev.map((p) =>
+                    p.id === projectId
+                      ? {
+                          ...p,
+                          databaseConfig: mergeIncomingDbSchema(
+                            p.databaseConfig,
+                            incomingTables
+                          ),
+                        }
+                      : p
+                  )
+                );
+                window.dispatchEvent(
+                  new CustomEvent('aicraft:db-updated', { detail: { projectId } })
+                );
               } else if (evt.type === 'credits') {
                 const desiredTarget =
                   typeof evt.targetUsed === 'number'
@@ -1133,6 +1238,25 @@ export default function App() {
                     modelProvider: evt.provider ?? t.modelProvider,
                   };
                 });
+                if (Array.isArray(evt.dbTables) && evt.dbTables.length > 0) {
+                  const doneTables = evt.dbTables;
+                  setProjects((prev) =>
+                    prev.map((p) =>
+                      p.id === projectId
+                        ? {
+                            ...p,
+                            databaseConfig: mergeIncomingDbSchema(
+                              p.databaseConfig,
+                              doneTables
+                            ),
+                          }
+                        : p
+                    )
+                  );
+                  window.dispatchEvent(
+                    new CustomEvent('aicraft:db-updated', { detail: { projectId } })
+                  );
+                }
                 if (evt.billing) {
                   applyBillingSummary(evt.billing);
                 } else {
@@ -1374,6 +1498,10 @@ export default function App() {
               webSearchEnabled: true,
               attachmentName: turn.attachmentName,
               attachmentDataUrl: turn.attachmentDataUrl ?? null,
+              secretKeys: (project.secrets ?? []).map((s) => s.key),
+              databaseTables: (project.databaseConfig?.tables ?? []).map(
+                (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
+              ),
             },
             previousHtml,
             turn.startedAt ?? Date.now()
@@ -1417,6 +1545,10 @@ export default function App() {
                 webSearchEnabled: true,
                 attachmentName: turn.attachmentName,
                 attachmentDataUrl: turn.attachmentDataUrl ?? null,
+                secretKeys: (project.secrets ?? []).map((s) => s.key),
+                databaseTables: (project.databaseConfig?.tables ?? []).map(
+                  (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
+                ),
               },
               previousHtml,
               turn.startedAt ?? Date.now()

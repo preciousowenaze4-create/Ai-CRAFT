@@ -32,6 +32,7 @@ import {
   ComposerOptions,
   MODE_THEMES,
   OpenRouterModel,
+  ProjectDatabaseColumn,
   ProjectDatabaseConfig,
   ProjectDeploymentConfig,
   ProjectSecret,
@@ -74,6 +75,7 @@ function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
   const cleaned = raw
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*DB_SCHEMA\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '');
   if (!isBuildTurn) return cleaned.trim();
   return cleaned
@@ -266,6 +268,9 @@ export function BuilderWorkspace({
     return parts;
   }, [latestPreviewHtml]);
 
+  const databaseConfigRef = useRef(databaseConfig);
+  databaseConfigRef.current = databaseConfig;
+
   const secretsFingerprint = useMemo(
     () => secrets.map((s) => `${s.key}:${s.updatedAt}`).join('|'),
     [secrets]
@@ -278,17 +283,33 @@ export function BuilderWorkspace({
     for (const s of secrets) {
       if (s.key) envMap[s.key] = s.value;
     }
+    const dbPrefix = `aicraft_db_${projectId}_`;
+    const initialDbMap: Record<string, unknown[]> = {};
+    try {
+      for (let i = 0; i < window.localStorage.length; i += 1) {
+        const key = window.localStorage.key(i);
+        if (!key || !key.startsWith(dbPrefix)) continue;
+        const tblName = key.slice(dbPrefix.length);
+        const raw = window.localStorage.getItem(key);
+        const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+        initialDbMap[tblName] = Array.isArray(parsed) ? parsed : [];
+      }
+    } catch {
+      // ignore storage read error
+    }
+
     const safeEnvJson = JSON.stringify(envMap).replace(/</g, '\\u003c');
-    const safeDbPrefix = JSON.stringify(`aicraft_db_${projectId}_`).replace(/</g, '\\u003c');
+    const safeInitialDbJson = JSON.stringify(initialDbMap).replace(/</g, '\\u003c');
+    const safeDbPrefix = JSON.stringify(dbPrefix).replace(/</g, '\\u003c');
     const safeDbMeta = JSON.stringify({
-      enabled: databaseConfig.enabled,
-      apiUrl: databaseConfig.apiUrl || '',
-      tables: databaseConfig.tables.map((t) => t.name),
+      enabled: databaseConfigRef.current.enabled,
+      tables: databaseConfigRef.current.tables.map((t) => t.name),
     }).replace(/</g, '\\u003c');
 
     const bridgeScript = `<script>
 (function(){
   var envMap = ${safeEnvJson};
+  var dbCache = ${safeInitialDbJson};
   var dbPrefix = ${safeDbPrefix};
   var dbMeta = ${safeDbMeta};
   window.__AICRAFT_ENV__ = envMap;
@@ -302,48 +323,27 @@ export function BuilderWorkspace({
     };
     return;
   }
+  function cleanTable(table) {
+    return String(table || 'items').trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'items';
+  }
   function readTable(table) {
+    var t = cleanTable(table);
+    if (Array.isArray(dbCache[t])) return dbCache[t].slice();
     try {
-      var raw = window.localStorage.getItem(dbPrefix + String(table || 'items'));
+      var raw = window.localStorage.getItem(dbPrefix + t);
       var parsed = raw ? JSON.parse(raw) : [];
-      return Array.isArray(parsed) ? parsed : [];
+      dbCache[t] = Array.isArray(parsed) ? parsed : [];
+      return dbCache[t].slice();
     } catch (e) { return []; }
   }
   function writeTable(table, rows) {
+    var t = cleanTable(table);
+    dbCache[t] = Array.isArray(rows) ? rows : [];
     try {
-      window.localStorage.setItem(dbPrefix + String(table || 'items'), JSON.stringify(rows));
+      window.localStorage.setItem(dbPrefix + t, JSON.stringify(dbCache[t]));
     } catch (e) {}
-    return rows;
+    return dbCache[t];
   }
-  var dbApi = {
-    meta: dbMeta,
-    list: function(table) { return Promise.resolve(readTable(table)); },
-    insert: function(table, row) {
-      var rows = readTable(table);
-      var item = Object.assign({ id: 'rec_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), created_at: new Date().toISOString() }, row || {});
-      rows.unshift(item);
-      writeTable(table, rows);
-      return Promise.resolve(item);
-    },
-    update: function(table, id, patch) {
-      var updated = null;
-      var rows = readTable(table).map(function(r) {
-        if (r && r.id === id) { updated = Object.assign({}, r, patch || {}); return updated; }
-        return r;
-      });
-      writeTable(table, rows);
-      return Promise.resolve(updated);
-    },
-    remove: function(table, id) {
-      var rows = readTable(table).filter(function(r) { return !r || r.id !== id; });
-      writeTable(table, rows);
-      return Promise.resolve(true);
-    },
-    clear: function(table) {
-      writeTable(table, []);
-      return Promise.resolve(true);
-    }
-  };
   var pending = {};
   window.addEventListener('message', function(e) {
     var d = e.data;
@@ -351,10 +351,74 @@ export function BuilderWorkspace({
     var cb = pending[d.id];
     if (!cb) return;
     delete pending[d.id];
+    if (cb.timer) clearTimeout(cb.timer);
     if (d.error) cb.reject(new Error(d.error));
     else if (typeof d.data !== 'undefined') cb.resolve(d.data);
     else cb.resolve(d.text || '');
   });
+  function sendDbOp(op, payload, fallbackValue) {
+    return new Promise(function(resolve) {
+      var id = 'db_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      var timer = setTimeout(function() {
+        if (pending[id]) {
+          delete pending[id];
+          resolve(fallbackValue);
+        }
+      }, 600);
+      pending[id] = {
+        timer: timer,
+        resolve: function(val) { resolve(val); },
+        reject: function() { resolve(fallbackValue); }
+      };
+      try {
+        window.parent.postMessage(Object.assign({ type: 'aicraft:db', id: id, op: op }, payload), '*');
+      } catch (e) {
+        clearTimeout(timer);
+        delete pending[id];
+        resolve(fallbackValue);
+      }
+    });
+  }
+  var dbApi = {
+    meta: dbMeta,
+    list: function(table) {
+      var t = cleanTable(table);
+      var cached = readTable(t);
+      return sendDbOp('list', { table: t }, cached).then(function(rows) {
+        if (Array.isArray(rows)) dbCache[t] = rows;
+        return Array.isArray(rows) ? rows : cached;
+      });
+    },
+    insert: function(table, row) {
+      var t = cleanTable(table);
+      var rows = readTable(t);
+      var item = Object.assign({ id: 'rec_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), created_at: new Date().toISOString() }, row || {});
+      rows.unshift(item);
+      writeTable(t, rows);
+      return sendDbOp('insert', { table: t, row: item }, item);
+    },
+    update: function(table, id, patch) {
+      var t = cleanTable(table);
+      var updated = null;
+      var rows = readTable(t).map(function(r) {
+        if (r && r.id === id) { updated = Object.assign({}, r, patch || {}); return updated; }
+        return r;
+      });
+      writeTable(t, rows);
+      return sendDbOp('update', { table: t, rowId: id, patch: patch || {} }, updated);
+    },
+    remove: function(table, id) {
+      var t = cleanTable(table);
+      var rows = readTable(t).filter(function(r) { return !r || r.id !== id; });
+      writeTable(t, rows);
+      return sendDbOp('remove', { table: t, rowId: id }, true);
+    },
+    clear: function(table) {
+      var t = cleanTable(table);
+      writeTable(t, []);
+      return sendDbOp('clear', { table: t }, true);
+    }
+  };
   function ask(prompt) {
     return new Promise(function(resolve, reject) {
       var id = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2);
@@ -388,7 +452,7 @@ export function BuilderWorkspace({
       return latestPreviewHtml.replace(/<\/head>/i, `${bridgeScript}</head>`);
     }
     return `${bridgeScript}${latestPreviewHtml}`;
-  }, [latestPreviewHtml, secrets, projectId, databaseConfig]);
+  }, [latestPreviewHtml, secrets, projectId]);
 
   const activeModel = useMemo(
     () => models.find((m) => m.id === selectedModel) ?? null,
@@ -397,13 +461,18 @@ export function BuilderWorkspace({
 
   const hasContent = followUp.trim().length > 0 || attachment !== null;
 
-  // Connect preview iframe postMessage bridge to live OpenRouter/AI stream and browser search
+  // Connect preview iframe postMessage bridge to live database, OpenRouter/AI stream, and browser search
   useEffect(() => {
     const handleBridgeMessage = async (event: MessageEvent) => {
       const data = event.data as
         | {
             type?: string;
             id?: string;
+            op?: 'list' | 'insert' | 'update' | 'remove' | 'clear';
+            table?: string;
+            row?: Record<string, unknown>;
+            rowId?: string;
+            patch?: Record<string, unknown>;
             prompt?: string;
             query?: string;
             instruction?: string;
@@ -418,7 +487,151 @@ export function BuilderWorkspace({
           backendEnabled: false,
           webSearchEnabled,
           attachmentName: null,
+          secretKeys: secrets.map((s) => s.key),
+          databaseTables: databaseConfigRef.current.tables.map(
+            (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
+          ),
         });
+        return;
+      }
+
+      if (data.type === 'aicraft:db' && data.id && data.op) {
+        const replyTarget = previewIframeRef.current?.contentWindow;
+        const cleanTable =
+          String(data.table || 'items')
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9_]+/g, '_')
+            .replace(/^_+|_+$/g, '') || 'items';
+        const storageKey = `aicraft_db_${projectId}_${cleanTable}`;
+
+        const readRows = (): Array<Record<string, unknown>> => {
+          try {
+            const raw = window.localStorage.getItem(storageKey);
+            const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+            return Array.isArray(parsed)
+              ? (parsed.filter((r) => r && typeof r === 'object') as Array<Record<string, unknown>>)
+              : [];
+          } catch {
+            return [];
+          }
+        };
+        const writeRows = (rows: Array<Record<string, unknown>>) => {
+          try {
+            window.localStorage.setItem(storageKey, JSON.stringify(rows));
+          } catch {
+            // ignore quota restriction
+          }
+        };
+
+        let result: unknown = [];
+        let sampleRowForSchema: Record<string, unknown> | null = null;
+
+        if (data.op === 'list') {
+          const rows = readRows();
+          result = rows;
+          if (rows.length > 0) sampleRowForSchema = rows[0];
+        } else if (data.op === 'insert') {
+          const rows = readRows();
+          const item: Record<string, unknown> = {
+            id: `rec_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            created_at: new Date().toISOString(),
+            ...(data.row && typeof data.row === 'object' ? data.row : {}),
+          };
+          const deduped = rows.filter((r) => r.id !== item.id);
+          deduped.unshift(item);
+          writeRows(deduped);
+          result = item;
+          sampleRowForSchema = item;
+        } else if (data.op === 'update') {
+          let updated: Record<string, unknown> | null = null;
+          const nextRows = readRows().map((r) => {
+            if (r.id === data.rowId) {
+              updated = {
+                ...r,
+                ...(data.patch && typeof data.patch === 'object' ? data.patch : {}),
+              };
+              return updated;
+            }
+            return r;
+          });
+          writeRows(nextRows);
+          result = updated;
+          if (updated) sampleRowForSchema = updated;
+        } else if (data.op === 'remove') {
+          const nextRows = readRows().filter((r) => r.id !== data.rowId);
+          writeRows(nextRows);
+          result = true;
+        } else if (data.op === 'clear') {
+          writeRows([]);
+          result = true;
+        }
+
+        // Automatically sync any newly created runtime tables/columns into project databaseConfig
+        if (sampleRowForSchema || data.op === 'insert') {
+          const currentDb = databaseConfigRef.current;
+          const existingTable = currentDb.tables.find((t) => t.name === cleanTable);
+          const inferredCols: ProjectDatabaseColumn[] = Object.entries(
+            sampleRowForSchema || {}
+          ).map(([k, v]) => {
+            const colName = k.toLowerCase().replace(/[^a-z0-9_]+/g, '_');
+            const colType: ProjectDatabaseColumn['type'] =
+              typeof v === 'number'
+                ? 'number'
+                : typeof v === 'boolean'
+                  ? 'boolean'
+                  : v !== null && typeof v === 'object'
+                    ? 'json'
+                    : colName === 'created_at' || colName === 'updated_at' || colName.endsWith('_at')
+                      ? 'timestamp'
+                      : 'text';
+            return { name: colName, type: colType, required: colName === 'id' };
+          });
+
+          if (!existingTable) {
+            onUpdateDatabase({
+              ...currentDb,
+              enabled: true,
+              tables: [
+                ...currentDb.tables,
+                {
+                  id: `tbl-${Date.now()}-${cleanTable}`,
+                  name: cleanTable,
+                  columns:
+                    inferredCols.length > 0
+                      ? inferredCols
+                      : [
+                          { name: 'id', type: 'text', required: true },
+                          { name: 'created_at', type: 'timestamp' },
+                        ],
+                },
+              ],
+              updatedAt: new Date().toISOString(),
+            });
+          } else {
+            const existingNames = new Set(existingTable.columns.map((c) => c.name));
+            const newCols = inferredCols.filter((c) => c.name && !existingNames.has(c.name));
+            if (newCols.length > 0) {
+              onUpdateDatabase({
+                ...currentDb,
+                tables: currentDb.tables.map((t) =>
+                  t.name === cleanTable
+                    ? { ...t, columns: [...t.columns, ...newCols] }
+                    : t
+                ),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+        }
+
+        window.dispatchEvent(
+          new CustomEvent('aicraft:db-updated', { detail: { projectId, table: cleanTable } })
+        );
+        replyTarget?.postMessage(
+          { type: 'aicraft:reply', id: data.id, data: result },
+          '*'
+        );
         return;
       }
 
@@ -485,7 +698,14 @@ export function BuilderWorkspace({
               model: selectedModel || undefined,
               clientTime: new Date().toLocaleString(),
               clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-              options: { webSearchEnabled, forceChat: true },
+              options: {
+                webSearchEnabled,
+                forceChat: true,
+                secretKeys: secrets.map((s) => s.key),
+                databaseTables: databaseConfigRef.current.tables.map(
+                  (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
+                ),
+              },
             }),
           });
           if (!response.ok || !response.body) {
@@ -569,6 +789,9 @@ export function BuilderWorkspace({
     onPaymentRequired,
     onSendFollowUp,
     onSetView,
+    onUpdateDatabase,
+    projectId,
+    secrets,
     selectedModel,
     webSearchEnabled,
   ]);
@@ -1716,13 +1939,11 @@ export function BuilderWorkspace({
         open={activeDrawer === 'database'}
         projectId={projectId}
         projectTitle={projectTitle}
+        hasBuiltApp={hasBuiltApp}
+        isStreaming={isStreaming}
         latestPreviewHtml={latestPreviewHtml}
         databaseConfig={databaseConfig}
         onClose={() => setActiveDrawer(null)}
-        onUpdateDatabase={onUpdateDatabase}
-        onApplySchemaWithAi={(promptText) =>
-          onSendFollowUp(promptText, buildFollowUpOptions())
-        }
       />
 
       <ProjectDeployModal

@@ -712,10 +712,160 @@ function extractPreviewStructureSummary(previousHtml: string): string {
     .join('\n');
 }
 
+interface ParsedDbColumn {
+  name: string;
+  type: 'text' | 'number' | 'boolean' | 'timestamp' | 'json';
+  required?: boolean;
+}
+
+interface ParsedDbTable {
+  name: string;
+  columns: ParsedDbColumn[];
+}
+
+function sanitizeDbIdent(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function normalizeDbColType(
+  rawType: string | undefined,
+  colName: string
+): ParsedDbColumn['type'] {
+  const t = (rawType || '').trim().toLowerCase();
+  if (t === 'number' || t === 'numeric' || t === 'int' || t === 'integer' || t === 'float' || t === 'decimal') {
+    return 'number';
+  }
+  if (t === 'boolean' || t === 'bool') return 'boolean';
+  if (t === 'timestamp' || t === 'timestamptz' || t === 'datetime' || t === 'date') {
+    return 'timestamp';
+  }
+  if (t === 'json' || t === 'jsonb' || t === 'array' || t === 'object') return 'json';
+  if (t === 'text' || t === 'string' || t === 'varchar' || t === 'uuid') return 'text';
+  if (colName === 'created_at' || colName === 'updated_at' || colName.endsWith('_at')) return 'timestamp';
+  if (colName === 'count' || colName === 'amount' || colName === 'price' || colName === 'likes' || colName === 'views' || colName.endsWith('_count')) {
+    return 'number';
+  }
+  if (colName.startsWith('is_') || colName.startsWith('has_')) return 'boolean';
+  return 'text';
+}
+
+function extractDbSchemaFromRaw(raw: string): ParsedDbTable[] {
+  const tableMap = new Map<string, ParsedDbTable>();
+  const regex = /\[\[\s*DB_SCHEMA\s*:\s*([^\]]+?)\s*\]\]/gi;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(raw)) !== null) {
+    const body = match[1].trim();
+    const entries = body.split(/;|\|/).map((s) => s.trim()).filter(Boolean);
+    for (const entry of entries) {
+      const tblMatch = /^([a-zA-Z0-9_-]+)\s*(?:\(([^)]*)\))?/.exec(entry);
+      if (!tblMatch) continue;
+      const tblName = sanitizeDbIdent(tblMatch[1]);
+      if (!tblName) continue;
+      const rawCols = (tblMatch[2] || 'id:text, created_at:timestamp')
+        .split(',')
+        .map((c) => c.trim())
+        .filter(Boolean);
+      const cols: ParsedDbColumn[] = [];
+      const seenCols = new Set<string>();
+      for (const colToken of rawCols) {
+        const [rawCol, rawType] = colToken.split(':').map((s) => s.trim());
+        const colName = sanitizeDbIdent(rawCol || '');
+        if (!colName || seenCols.has(colName)) continue;
+        seenCols.add(colName);
+        cols.push({
+          name: colName,
+          type: normalizeDbColType(rawType, colName),
+          required: colName === 'id',
+        });
+      }
+      if (cols.length === 0) {
+        cols.push(
+          { name: 'id', type: 'text', required: true },
+          { name: 'created_at', type: 'timestamp' }
+        );
+      }
+      tableMap.set(tblName, { name: tblName, columns: cols });
+    }
+    if (tableMap.size >= 12) break;
+  }
+  return Array.from(tableMap.values());
+}
+
+function extractDbSchemaFromHtml(html: string): ParsedDbTable[] {
+  if (!html) return [];
+  const tableMap = new Map<string, Map<string, ParsedDbColumn>>();
+  const ensureTable = (rawName: string) => {
+    const clean = sanitizeDbIdent(rawName);
+    if (!clean) return null;
+    let map = tableMap.get(clean);
+    if (!map) {
+      map = new Map<string, ParsedDbColumn>();
+      tableMap.set(clean, map);
+    }
+    return map;
+  };
+  const addCol = (map: Map<string, ParsedDbColumn>, rawCol: string, rawType?: string) => {
+    const colName = sanitizeDbIdent(rawCol);
+    if (!colName || map.has(colName)) return;
+    map.set(colName, {
+      name: colName,
+      type: normalizeDbColType(rawType, colName),
+      required: colName === 'id',
+    });
+  };
+
+  const dbCallRegex =
+    /AICraft\.db\.\w+\(\s*['"`]([a-zA-Z0-9_-]+)['"`](?:\s*,\s*(?:['"`][^'"`]*['"`]\s*,\s*)?\{([\s\S]{0,400}?)\})?/g;
+  for (const m of html.matchAll(dbCallRegex)) {
+    const colMap = ensureTable(m[1] || '');
+    if (!colMap) continue;
+    addCol(colMap, 'id', 'text');
+    if (m[2]) {
+      const propRegex = /(?:^|[,{])\s*['"]?([a-zA-Z_][a-zA-Z0-9_]*)['"]?\s*:/g;
+      for (const p of m[2].matchAll(propRegex)) {
+        if (p[1]) addCol(colMap, p[1]);
+      }
+    }
+    addCol(colMap, 'created_at', 'timestamp');
+  }
+
+  return Array.from(tableMap.entries())
+    .slice(0, 12)
+    .map(([name, cols]) => ({ name, columns: Array.from(cols.values()) }));
+}
+
+function mergeParsedDbTables(...lists: ParsedDbTable[][]): ParsedDbTable[] {
+  const merged = new Map<string, ParsedDbTable>();
+  for (const list of lists) {
+    for (const tbl of list) {
+      const cleanName = sanitizeDbIdent(tbl.name);
+      if (!cleanName) continue;
+      const existing = merged.get(cleanName);
+      if (!existing) {
+        merged.set(cleanName, { name: cleanName, columns: [...tbl.columns] });
+      } else {
+        const seen = new Set(existing.columns.map((c) => c.name));
+        for (const col of tbl.columns) {
+          if (!seen.has(col.name)) {
+            seen.add(col.name);
+            existing.columns.push(col);
+          }
+        }
+      }
+    }
+  }
+  return Array.from(merged.values());
+}
+
 function stripTagMarkers(text: string): string {
   return text
     .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
     .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*DB_SCHEMA\s*:[^\]]*\]\]\s*\n?/gi, '')
     .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '');
 }
 
@@ -1172,32 +1322,43 @@ export async function POST(request: Request): Promise<Response> {
           activeFlags.push(`Attached reference: ${options.attachmentName}`);
         }
         if (secretKeys.length > 0) {
-          activeFlags.push(
-            `Configured project secrets (read via window.AICraft.getSecret(key) or window.ENV[key]): ${secretKeys.join(', ')}`
-          );
+          activeFlags.push(`Project secrets keys configured: ${secretKeys.join(', ')}`);
         }
         if (databaseTables.length > 0) {
-          activeFlags.push(
-            `Configured project database tables (persist via window.AICraft.db): ${databaseTables.join('; ')}`
-          );
+          activeFlags.push(`Existing project database tables: ${databaseTables.join('; ')}`);
         }
+
+        const projectInfraContext = [
+          'PROJECT SECRETS & REAL-TIME DATABASE INFRASTRUCTURE:',
+          secretKeys.length > 0
+            ? `- Saved project Secret keys available at runtime in this app: ${secretKeys.join(', ')}.`
+            : '- No project Secret keys saved yet. Users can add API keys/tokens anytime via the "Secrets" button in the bottom composer toolbar (+ Add secret -> Apply changes).',
+          '- Where project Secrets live at runtime: In generated apps, read any secret safely via `window.AICraft?.getSecret("KEY_NAME") || window.ENV?.KEY_NAME || window.__AICRAFT_ENV__?.KEY_NAME || (typeof process !== "undefined" && process.env ? process.env.KEY_NAME : "") || ""`. Never hardcode secret values.',
+          databaseTables.length > 0
+            ? `- Existing structured project Database tables: ${databaseTables.join('; ')}.`
+            : '- The project Database drawer automatically captures and structures tables in real time as the app is built and used — users never manually input Supabase keys or table forms.',
+          '- Real-time Database API: Generated apps persist data with `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, `await window.AICraft.db.remove("table", id)`.',
+        ].join('\n');
 
         const previewSummary = extractPreviewStructureSummary(previousHtml);
 
         const buildRulesBlock = [
           'CALM ARCHITECTURAL DISCIPLINE — DO NOT RUSH INTO CODE:',
           'Before writing any HTML, slow down and think carefully like a senior product architect & monetization strategist:',
-          'STEP 0 (Architectural Planning Lines): Output 4 short planning lines using exact format `[[PLAN: <step>]]` covering:',
+          'STEP 0 (Architectural Planning & Structured Database Lines): Output 4 short planning lines using exact format `[[PLAN: <step>]]` covering:',
           '  1) `[[PLAN: Color palette & typography — ...]]` (choose a refined, harmonious color palette, high-contrast surfaces, crisp font hierarchy)',
           '  2) `[[PLAN: Layout & button placement — ...]]` (plan clean visual structure, thumb-friendly 44px+ buttons, intuitive header & bottom nav placement, balanced spacing)',
-          '  3) `[[PLAN: Real-time features & live media — ...]]` (plan real clocks/timers, localStorage persistence, live `window.AICraft.search(query)` / `window.AICraft.ask(prompt)`, and verified search images or crisp inline SVGs)',
+          '  3) `[[PLAN: Real-time features & live media — ...]]` (plan real clocks/timers, `window.AICraft.db` persistence, live `window.AICraft.search(query)` / `window.AICraft.ask(prompt)`, and verified search images or crisp inline SVGs)',
           '  4) `[[PLAN: Monetization & growth flow — ...]]` (plan built-in interactive monetization tailored to the app: Pro/Premium plan sheet, monthly/annual toggle, credits/checkout drawer, creator tips, or revenue metrics)',
-          'PART 1 (Architectural Overview & Feedback): Write 2–3 calm, clear plain-text sentences summarizing the structure, color choices, button layout, real-time functionality, and monetization you built, plus brief feedback on how it can grow next. ABSOLUTELY PROHIBITED IN PART 1: NEVER include raw code, HTML tags, CSS, JS, markdown code fences (```), backticks, or the words "PART 1" / "PART 2" / "PART 3", and NEVER tell the user to copy/paste code.',
+          'STEP 0B (Automatic Real-Time Database Schema Lines): Whenever the app you are building stores or manages data (e.g. a TikTok-style app -> `profiles`, `videos`, `comments`, `likes`; a store -> `products`, `orders`; a tracker -> `entries`), IMMEDIATELY output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Example: `[[DB_SCHEMA: profiles(id:text, username:text, bio:text, followers_count:number, created_at:timestamp)]]`.',
+          'PART 1 (Architectural Overview & Feedback): Write 2–3 calm, clear plain-text sentences summarizing the structure, color choices, button layout, real-time database/features, and monetization you built, plus brief feedback on how it can grow next. If the app integrates an external API key or uses project secrets, mention the exact key name stored in Secrets. ABSOLUTELY PROHIBITED IN PART 1: NEVER include raw code, HTML tags, CSS, JS, markdown code fences (```), backticks, or the words "PART 1" / "PART 2" / "PART 3", and NEVER tell the user to copy/paste code.',
           'PART 2 (Full-Screen Real-Time App): On a new line immediately output the exact marker <<<AICRAFT_APP_HTML>>> followed by a complete, thoughtfully crafted, self-contained, runnable <!DOCTYPE html> application ending with <<<END_AICRAFT_APP_HTML>>>.',
           'Rules for the HTML app in PART 2:',
           `- Design it as a refined ${targetLabel} experience inside AI Craft's full-screen Preview tab.`,
           '- COHESIVE COLOR & ERGONOMIC BUTTONS: Craft a polished color system (clean surface hierarchy, tasteful accent, accessible contrast), smooth transitions, and well-placed >= 44px touch-target buttons (clear primary CTA, uncluttered header, intuitive navigation).',
-          '- BUILD & MONETIZE IN REAL TIME: Every app must include working interactive flows, real-time clock/date or live timers, `localStorage` persistence, plus a genuine interactive monetization feature tailored naturally to the app (such as a working Pro/Premium upgrade modal with monthly/annual switch, interactive checkout/wallet flow, creator tip jar, featured/sponsored tier, or live revenue/MRR widget).',
+          '- REAL-TIME STRUCTURED DATABASE & PERSISTENCE: Persist all app data via `window.AICraft.db` (`list`, `insert`, `update`, `remove`). On first load, if `await window.AICraft.db.list(table)` is empty, seed 2–4 realistic starter rows via `window.AICraft.db.insert(...)` so the app and live Database drawer work immediately.',
+          '- PROJECT SECRETS ACCESS: When calling any external API or using configured keys, always read `const apiKey = window.AICraft?.getSecret?.("KEY_NAME") || window.ENV?.KEY_NAME || process?.env?.KEY_NAME || "";` cleanly with graceful UI handling if a key has not been added to Secrets yet.',
+          '- BUILD & MONETIZE IN REAL TIME: Every app must include working interactive flows, real-time clock/date or live timers, plus a genuine interactive monetization feature tailored naturally to the app (such as a working Pro/Premium upgrade modal with monthly/annual switch, interactive checkout/wallet flow, creator tip jar, featured/sponsored tier, or live revenue/MRR widget).',
           '- GOOGLE/WEB SEARCH & REAL IMAGES: Use `await window.AICraft.search(query)` (automatically injected in Preview—returns `{ query, results, images }` with real snippets and `imageUrl`) and `await window.AICraft.ask(prompt)` for live AI responses/content. If you embed verified `https://` image URLs from the search grounding above, always include a clean `onerror` fallback so broken icons never appear; otherwise use crisp inline SVGs and CSS gradients.',
           '- SURGICAL SCREENSHOT & PREVIEW EDITING: When updating an existing Preview app or inspecting an attached screenshot, identify precisely what the user wants removed/cut vs. kept, remove ONLY what was requested, preserve everything else cleanly, and output the complete updated <!DOCTYPE html> app.',
           '- Organize multi-screen apps (like Feed, Discover, Pricing/Pro, Checkout, Profile, Settings, Dashboard) using semantic `<section id="...">`, `<nav>`, `<header>` tags.',
@@ -1216,12 +1377,15 @@ export async function POST(request: Request): Promise<Response> {
           systemInstruction = [
             'You are AI Craft, a helpful, natural, real-time AI assistant with live browser search access.',
             `Real-time clock context: ${timeContext}.`,
+            projectInfraContext,
             webSearchContext ? `\n${webSearchContext}` : '',
             previewSummary
               ? `\nContext about the user's current Preview app (for answering questions accurately without rebuilding):\n${previewSummary}`
               : '',
             'Respond directly and conversationally in real time to the user message.',
             'The user is chatting or asking a question right now — reply naturally without rebuilding the app or outputting HTML code.',
+            'If asked about project Secrets or API keys, clearly reference the configured key names above and explain they live in the Secrets button inside the composer toolbar (`window.AICraft.getSecret("KEY")`, `window.ENV`, `process.env`).',
+            'If asked about the Database, explain the structured tables built for this app in the Database button inside the composer toolbar (`window.AICraft.db`).',
             'NEVER tell the user to copy and paste code. If they later ask you to build or change the app, you will build it into Preview.',
             'If the user asks for the current time, date, or day, use the real-time clock context above accurately.',
             'Keep formatting clean and readable.',
@@ -1232,6 +1396,7 @@ export async function POST(request: Request): Promise<Response> {
           systemInstruction = [
             'You are AI Craft, an expert autonomous mobile and full-stack product builder directly wired into a live full-screen Preview workspace.',
             `Real-time clock context: ${timeContext}.`,
+            projectInfraContext,
             webSearchContext ? `\n${webSearchContext}` : '',
             previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
             'CRITICAL OUTPUT CONTRACT — TWO STRICTLY SEPARATED PARTS:',
@@ -1245,6 +1410,7 @@ export async function POST(request: Request): Promise<Response> {
           systemInstruction = [
             'You are AI Craft, an intelligent real-time AI assistant AND autonomous product builder connected to a live Preview workspace.',
             `Real-time clock context: ${timeContext}.`,
+            projectInfraContext,
             webSearchContext ? `\n${webSearchContext}` : '',
             previewSummary ? `\nLIVE PREVIEW ENVIRONMENT AWARENESS:\n${previewSummary}` : '',
             'THINK FIRST BEFORE RESPONDING:',
@@ -1310,6 +1476,8 @@ export async function POST(request: Request): Promise<Response> {
         let htmlStartIndex = -1;
         let emittedFiles: string[] = [];
         let emittedPlanSteps: string[] = [];
+        let emittedDbSignature = '';
+        let emittedDbTables: ParsedDbTable[] = [];
         let lastProgressSentAt = 0;
         let buildCreditsEmitted = 0;
         let lastCreditEmitAt = 0;
@@ -1322,6 +1490,7 @@ export async function POST(request: Request): Promise<Response> {
             emittedProseLength > 0 ||
             emittedFiles.length > 0 ||
             emittedPlanSteps.length > 0 ||
+            emittedDbTables.length > 0 ||
             emittedBuildPhase ||
             buildCreditsEmitted > 0
           ) {
@@ -1337,6 +1506,8 @@ export async function POST(request: Request): Promise<Response> {
           htmlStartIndex = -1;
           emittedFiles = [];
           emittedPlanSteps = [];
+          emittedDbSignature = '';
+          emittedDbTables = [];
           lastProgressSentAt = 0;
           buildCreditsEmitted = 0;
           lastCreditEmitAt = 0;
@@ -1360,6 +1531,19 @@ export async function POST(request: Request): Promise<Response> {
                 type: 'plan',
                 step,
                 allSteps: [...emittedPlanSteps],
+              });
+            }
+          }
+
+          const dbTables = extractDbSchemaFromRaw(rawSoFar);
+          if (dbTables.length > 0) {
+            const sig = JSON.stringify(dbTables);
+            if (sig !== emittedDbSignature) {
+              emittedDbSignature = sig;
+              emittedDbTables = dbTables;
+              sendEvent({
+                type: 'schema',
+                tables: dbTables,
               });
             }
           }
@@ -1820,6 +2004,7 @@ export async function POST(request: Request): Promise<Response> {
         let previewHtml = '';
         let finalFiles: string[] = [];
         let finalSuggestions: string[] = [];
+        let finalDbTables: ParsedDbTable[] = [];
 
         if (resolvedKind === 'chat') {
           finalProse = stripTagMarkers(fullRaw).trim();
@@ -1838,6 +2023,12 @@ export async function POST(request: Request): Promise<Response> {
               ? parsedSuggestions
               : buildSmartFollowUpSuggestions(message, previewHtml, mode);
 
+          finalDbTables = mergeParsedDbTables(
+            emittedDbTables,
+            extractDbSchemaFromRaw(fullRaw),
+            extractDbSchemaFromHtml(previewHtml)
+          );
+
           if (!finalProse && previewHtml) {
             finalProse =
               'Your real-time app is thoughtfully structured, styled, and ready with monetization built in. Tap Preview to try it live, or pick an upgrade below.';
@@ -1851,6 +2042,13 @@ export async function POST(request: Request): Promise<Response> {
               path: finalFiles[0] || 'index.html',
               allFiles: finalFiles,
               bytesBuilt: previewHtml.length,
+            });
+          }
+
+          if (finalDbTables.length > 0) {
+            sendEvent({
+              type: 'schema',
+              tables: finalDbTables,
             });
           }
         }
@@ -1876,6 +2074,7 @@ export async function POST(request: Request): Promise<Response> {
           previewHtml,
           allFiles: finalFiles,
           suggestions: finalSuggestions,
+          dbTables: finalDbTables,
           bytesBuilt: previewHtml.length,
           creditsUsed: finalCreditsUsed,
           billing: updatedBilling,

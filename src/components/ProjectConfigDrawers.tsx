@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Check,
+  ChevronDown,
+  ChevronRight,
   Code2,
   Copy,
   Database,
@@ -9,9 +11,11 @@ import {
   Eye,
   EyeOff,
   KeyRound,
-  Pencil,
+  Lightbulb,
   Plus,
+  RefreshCw,
   Rocket,
+  Save,
   Share2,
   Trash2,
   X,
@@ -44,12 +48,6 @@ function normalizeSecretKey(raw: string): string {
     .replace(/^_+|_+$/g, '');
 }
 
-function maskSecretValue(value: string): string {
-  if (!value) return '••••••••';
-  if (value.length <= 6) return '••••••••';
-  return `••••••••••••${value.slice(-4)}`;
-}
-
 function sanitizeTableName(raw: string): string {
   return raw
     .trim()
@@ -58,31 +56,157 @@ function sanitizeTableName(raw: string): string {
     .replace(/^_+|_+$/g, '');
 }
 
+function normalizeColumnType(
+  rawType: string | undefined,
+  colName: string
+): ProjectDatabaseColumn['type'] {
+  const t = (rawType || '').trim().toLowerCase();
+  if (
+    t === 'number' ||
+    t === 'numeric' ||
+    t === 'int' ||
+    t === 'integer' ||
+    t === 'float' ||
+    t === 'decimal' ||
+    t === 'bigint'
+  ) {
+    return 'number';
+  }
+  if (t === 'boolean' || t === 'bool') return 'boolean';
+  if (
+    t === 'timestamp' ||
+    t === 'timestamptz' ||
+    t === 'datetime' ||
+    t === 'date'
+  ) {
+    return 'timestamp';
+  }
+  if (t === 'json' || t === 'jsonb' || t === 'array' || t === 'object') {
+    return 'json';
+  }
+  if (t === 'text' || t === 'string' || t === 'varchar' || t === 'uuid') {
+    return 'text';
+  }
+  if (
+    colName === 'created_at' ||
+    colName === 'updated_at' ||
+    colName.endsWith('_at')
+  ) {
+    return 'timestamp';
+  }
+  if (
+    colName === 'count' ||
+    colName === 'amount' ||
+    colName === 'price' ||
+    colName === 'likes' ||
+    colName === 'views' ||
+    colName.endsWith('_count')
+  ) {
+    return 'number';
+  }
+  if (colName.startsWith('is_') || colName.startsWith('has_')) {
+    return 'boolean';
+  }
+  return 'text';
+}
+
+function inferColumnTypeFromValue(
+  val: unknown,
+  colName: string
+): ProjectDatabaseColumn['type'] {
+  if (typeof val === 'number') return 'number';
+  if (typeof val === 'boolean') return 'boolean';
+  if (val !== null && typeof val === 'object') return 'json';
+  return normalizeColumnType(undefined, colName);
+}
+
 function detectSchemaFromHtml(html: string): {
-  dbTables: string[];
+  tables: ProjectDatabaseTable[];
   storageKeys: string[];
 } {
-  if (!html) return { dbTables: [], storageKeys: [] };
-  const dbTables = new Set<string>();
-  const storageKeys = new Set<string>();
+  if (!html) return { tables: [], storageKeys: [] };
 
-  const dbRegex = /AICraft\.db\.\w+\(\s*['"`]([a-zA-Z0-9_-]+)['"`]/g;
-  for (const m of html.matchAll(dbRegex)) {
-    if (m[1]) dbTables.add(m[1]);
+  const tableMap = new Map<string, Map<string, ProjectDatabaseColumn>>();
+  const ensureTable = (rawName: string) => {
+    const clean = sanitizeTableName(rawName);
+    if (!clean) return null;
+    let colMap = tableMap.get(clean);
+    if (!colMap) {
+      colMap = new Map<string, ProjectDatabaseColumn>();
+      tableMap.set(clean, colMap);
+    }
+    return colMap;
+  };
+  const addColumn = (
+    colMap: Map<string, ProjectDatabaseColumn>,
+    rawCol: string,
+    rawType?: string
+  ) => {
+    const cleanCol = sanitizeTableName(rawCol);
+    if (!cleanCol) return;
+    if (!colMap.has(cleanCol)) {
+      colMap.set(cleanCol, {
+        name: cleanCol,
+        type: normalizeColumnType(rawType, cleanCol),
+        required: cleanCol === 'id',
+      });
+    }
+  };
+
+  // 1. Detect window.AICraft.db.<op>('table', { field1: ..., field2: ... })
+  const dbCallRegex =
+    /AICraft\.db\.\w+\(\s*['"`]([a-zA-Z0-9_-]+)['"`](?:\s*,\s*(?:['"`][^'"`]*['"`]\s*,\s*)?\{([\s\S]{0,400}?)\})?/g;
+  for (const m of html.matchAll(dbCallRegex)) {
+    const colMap = ensureTable(m[1] || '');
+    if (!colMap) continue;
+    addColumn(colMap, 'id', 'text');
+    const objBody = m[2];
+    if (objBody) {
+      const propRegex = /(?:^|[,{])\s*['"]?([a-zA-Z_][a-zA-Z0-9_]*)['"]?\s*:/g;
+      for (const p of objBody.matchAll(propRegex)) {
+        if (p[1]) addColumn(colMap, p[1]);
+      }
+    }
+    addColumn(colMap, 'created_at', 'timestamp');
   }
 
-  const sqlRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)/gi;
+  // 2. Detect SQL CREATE TABLE definitions
+  const sqlRegex =
+    /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)\s*\(([\s\S]{1,800}?)\)/gi;
   for (const m of html.matchAll(sqlRegex)) {
-    if (m[1]) dbTables.add(m[1].toLowerCase());
+    const colMap = ensureTable(m[1] || '');
+    if (!colMap) continue;
+    const colLines = (m[2] || '').split(',');
+    for (const line of colLines) {
+      const trimmed = line.trim();
+      if (!trimmed || /^(?:PRIMARY|FOREIGN|UNIQUE|CHECK|CONSTRAINT)\b/i.test(trimmed)) {
+        continue;
+      }
+      const parts = trimmed.split(/\s+/);
+      if (parts[0]) {
+        addColumn(colMap, parts[0].replace(/["`]/g, ''), parts[1]);
+      }
+    }
   }
 
-  const lsRegex = /localStorage\.(?:getItem|setItem)\(\s*['"`]([a-zA-Z0-9_.:-]+)['"`]/g;
+  // 3. Detect app-specific localStorage keys
+  const storageKeys = new Set<string>();
+  const lsRegex =
+    /localStorage\.(?:getItem|setItem)\(\s*['"`]([a-zA-Z0-9_.:-]+)['"`]/g;
   for (const m of html.matchAll(lsRegex)) {
     if (m[1]) storageKeys.add(m[1]);
   }
 
+  const tables: ProjectDatabaseTable[] = Array.from(tableMap.entries())
+    .slice(0, 12)
+    .map(([name, colMap]) => ({
+      id: `detected-${name}`,
+      name,
+      columns: Array.from(colMap.values()),
+    }));
+
   return {
-    dbTables: Array.from(dbTables).slice(0, 12),
+    tables,
     storageKeys: Array.from(storageKeys).slice(0, 12),
   };
 }
@@ -169,6 +293,13 @@ function DrawerShell({
 /* 1. Per-Project Secrets / Environment Variables Modal                       */
 /* -------------------------------------------------------------------------- */
 
+interface SecretDraftRow {
+  id: string;
+  key: string;
+  value: string;
+  updatedAt: string;
+}
+
 interface ProjectSecretsModalProps {
   open: boolean;
   projectTitle: string;
@@ -177,12 +308,14 @@ interface ProjectSecretsModalProps {
   onUpdateSecrets: (next: ProjectSecret[]) => void;
 }
 
-const SUGGESTED_SECRET_KEYS = [
-  'OPENAI_API_KEY',
-  'STRIPE_SECRET_KEY',
-  'RESEND_API_KEY',
-  'WEBHOOK_SECRET',
-];
+function makeBlankSecretRow(): SecretDraftRow {
+  return {
+    id: `sec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    key: '',
+    value: '',
+    updatedAt: new Date().toISOString(),
+  };
+}
 
 export function ProjectSecretsModal({
   open,
@@ -191,22 +324,35 @@ export function ProjectSecretsModal({
   onClose,
   onUpdateSecrets,
 }: ProjectSecretsModalProps) {
-  const [newKey, setNewKey] = useState('');
-  const [newValue, setNewValue] = useState('');
-  const [showNewValue, setShowNewValue] = useState(false);
+  const [rows, setRows] = useState<SecretDraftRow[]>([]);
   const [revealedIds, setRevealedIds] = useState<Record<string, boolean>>({});
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editKey, setEditKey] = useState('');
-  const [editValue, setEditValue] = useState('');
-  const [showEditValue, setShowEditValue] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [showShareInfo, setShowShareInfo] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) {
-      setEditingId(null);
+      setShowShareInfo(false);
       setFeedback(null);
+      setErrorMsg(null);
+      setCopiedId(null);
+      return;
     }
-  }, [open]);
+    setRows(
+      secrets.length > 0
+        ? secrets.map((s) => ({
+            id: s.id,
+            key: s.key,
+            value: s.value,
+            updatedAt: s.updatedAt,
+          }))
+        : [makeBlankSecretRow()]
+    );
+    setRevealedIds({});
+    setFeedback(null);
+    setErrorMsg(null);
+  }, [open, secrets]);
 
   useEffect(() => {
     if (!feedback) return;
@@ -214,73 +360,87 @@ export function ProjectSecretsModal({
     return () => window.clearTimeout(t);
   }, [feedback]);
 
-  const handleAddSecret = (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleanedKey = normalizeSecretKey(newKey);
-    const cleanedValue = newValue.trim();
-    if (!cleanedKey) {
-      setFeedback('Enter a valid key name (e.g. OPENAI_API_KEY).');
-      return;
-    }
-    if (!cleanedValue) {
-      setFeedback('Paste the secret value before saving.');
-      return;
-    }
-
-    const nowIso = new Date().toISOString();
-    const existing = secrets.find((s) => s.key === cleanedKey);
-    let next: ProjectSecret[];
-    if (existing) {
-      next = secrets.map((s) =>
-        s.key === cleanedKey ? { ...s, value: cleanedValue, updatedAt: nowIso } : s
-      );
-      setFeedback(`Updated ${cleanedKey} for ${projectTitle}.`);
-    } else {
-      next = [
-        {
-          id: `sec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          key: cleanedKey,
-          value: cleanedValue,
-          updatedAt: nowIso,
-        },
-        ...secrets,
-      ];
-      setFeedback(`Saved ${cleanedKey} to ${projectTitle}.`);
-    }
-    onUpdateSecrets(next);
-    setNewKey('');
-    setNewValue('');
-    setShowNewValue(false);
-  };
-
-  const startEditing = (secret: ProjectSecret) => {
-    setEditingId(secret.id);
-    setEditKey(secret.key);
-    setEditValue(secret.value);
-    setShowEditValue(false);
-  };
-
-  const handleSaveEdit = (id: string) => {
-    const cleanedKey = normalizeSecretKey(editKey);
-    const cleanedValue = editValue.trim();
-    if (!cleanedKey || !cleanedValue) {
-      setFeedback('Key and value cannot be empty.');
-      return;
-    }
-    const next = secrets.map((s) =>
-      s.id === id
-        ? { ...s, key: cleanedKey, value: cleanedValue, updatedAt: new Date().toISOString() }
-        : s
+  const handleRowChange = (id: string, field: 'key' | 'value', nextVal: string) => {
+    setErrorMsg(null);
+    setRows((prev) =>
+      prev.map((row) =>
+        row.id === id
+          ? {
+              ...row,
+              [field]: nextVal,
+              updatedAt: new Date().toISOString(),
+            }
+          : row
+      )
     );
-    onUpdateSecrets(next);
-    setEditingId(null);
-    setFeedback(`Updated ${cleanedKey}.`);
   };
 
-  const handleDelete = (id: string, keyName: string) => {
-    onUpdateSecrets(secrets.filter((s) => s.id !== id));
-    if (editingId === id) setEditingId(null);
-    setFeedback(`Removed ${keyName}.`);
+  const handleAddBlankRow = () => {
+    setErrorMsg(null);
+    setRows((prev) => [...prev, makeBlankSecretRow()]);
+  };
+
+  const handleDeleteRow = (id: string) => {
+    setErrorMsg(null);
+    setRows((prev) => {
+      const remaining = prev.filter((r) => r.id !== id);
+      return remaining.length > 0 ? remaining : [makeBlankSecretRow()];
+    });
+  };
+
+  const handleCopyValue = async (row: SecretDraftRow) => {
+    if (!row.value) return;
+    try {
+      await navigator.clipboard.writeText(row.value);
+      setCopiedId(row.id);
+      window.setTimeout(() => setCopiedId((curr) => (curr === row.id ? null : curr)), 1600);
+    } catch {
+      // ignore clipboard restriction
+    }
+  };
+
+  const handleApplyChanges = () => {
+    setErrorMsg(null);
+    const cleanedRows: ProjectSecret[] = [];
+    const seenKeys = new Set<string>();
+
+    for (const row of rows) {
+      const rawKey = row.key.trim();
+      const rawValue = row.value.trim();
+      if (!rawKey && !rawValue) {
+        continue;
+      }
+      const normalizedKey = normalizeSecretKey(rawKey);
+      if (!normalizedKey) {
+        setErrorMsg('Enter a valid secret name (e.g. OPENAI_API_KEY) for every filled row.');
+        return;
+      }
+      if (!rawValue) {
+        setErrorMsg(`Enter a secret value for ${normalizedKey}.`);
+        return;
+      }
+      const nextSecret: ProjectSecret = {
+        id: row.id,
+        key: normalizedKey,
+        value: rawValue,
+        updatedAt: new Date().toISOString(),
+      };
+      if (seenKeys.has(normalizedKey)) {
+        const idx = cleanedRows.findIndex((s) => s.key === normalizedKey);
+        if (idx !== -1) cleanedRows[idx] = nextSecret;
+      } else {
+        seenKeys.add(normalizedKey);
+        cleanedRows.push(nextSecret);
+      }
+    }
+
+    onUpdateSecrets(cleanedRows);
+    setRows(cleanedRows.length > 0 ? cleanedRows : [makeBlankSecretRow()]);
+    setFeedback(
+      cleanedRows.length === 0
+        ? `Cleared all secrets for ${projectTitle}.`
+        : `Applied ${cleanedRows.length} ${cleanedRows.length === 1 ? 'secret' : 'secrets'} to ${projectTitle}.`
+    );
   };
 
   return (
@@ -291,69 +451,110 @@ export function ProjectSecretsModal({
       subtitle={`Environment variables scoped to ${projectTitle}`}
       icon={<KeyRound className="w-[18px] h-[18px] text-[#6D4AFF]" />}
     >
-      <div className="flex flex-col gap-5">
-        <form onSubmit={handleAddSecret} className="flex flex-col gap-2.5">
-          <div className="flex flex-col gap-2">
-            <label className="text-[12px] font-medium text-[#52525B]">
-              Add Environment Variable
-            </label>
-            <input
-              type="text"
-              value={newKey}
-              onChange={(e) => setNewKey(e.target.value)}
-              placeholder="KEY_NAME (e.g. OPENAI_API_KEY)"
-              autoCapitalize="characters"
-              autoCorrect="off"
-              spellCheck={false}
-              className="w-full h-11 px-3.5 rounded-xl border border-black/[0.12] bg-[#FAFAFC] font-mono text-[13px] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
-            />
-            <div className="relative flex items-center">
-              <input
-                type={showNewValue ? 'text' : 'password'}
-                value={newValue}
-                onChange={(e) => setNewValue(e.target.value)}
-                placeholder="Paste secret key or token..."
-                autoCorrect="off"
-                autoComplete="off"
-                spellCheck={false}
-                className="w-full h-11 pl-3.5 pr-11 rounded-xl border border-black/[0.12] bg-[#FAFAFC] font-mono text-[13px] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
-              />
-              <button
-                type="button"
-                onClick={() => setShowNewValue((v) => !v)}
-                aria-label={showNewValue ? 'Hide secret value' : 'Reveal secret value'}
-                className="absolute right-1 min-w-[40px] min-h-[40px] rounded-lg flex items-center justify-center text-[#71717A] hover:text-[#0B0B0F]"
+      <div className="flex flex-col gap-3.5">
+        {/* Inline Editable Secrets Rows */}
+        <div className="rounded-2xl border border-black/[0.09] bg-white overflow-hidden divide-y divide-black/[0.07]">
+          {rows.map((row) => {
+            const isRevealed = Boolean(revealedIds[row.id]);
+            const isCopied = copiedId === row.id;
+            return (
+              <div
+                key={row.id}
+                className="px-2.5 py-2.5 flex items-center gap-1.5 bg-white"
               >
-                {showNewValue ? (
-                  <EyeOff className="w-4 h-4" />
-                ) : (
-                  <Eye className="w-4 h-4" />
-                )}
-              </button>
-            </div>
-          </div>
+                <input
+                  type="text"
+                  value={row.key}
+                  onChange={(e) => handleRowChange(row.id, 'key', e.target.value)}
+                  placeholder="Secret name"
+                  aria-label="Secret name"
+                  autoCapitalize="characters"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  className="w-[34%] min-w-[92px] h-10 px-2.5 rounded-xl border border-black/[0.11] bg-[#FAFAFC] font-mono text-[12px] font-medium text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
+                />
 
-          <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
-            {SUGGESTED_SECRET_KEYS.map((sample) => (
-              <button
-                key={sample}
-                type="button"
-                onClick={() => setNewKey(sample)}
-                className="px-2.5 py-1.5 rounded-lg bg-[#F4F4F6] hover:bg-[#EAEAEF] text-[11px] font-mono text-[#3F3F46] whitespace-nowrap shrink-0 transition-colors"
-              >
-                + {sample}
-              </button>
-            ))}
-          </div>
+                <input
+                  type={isRevealed ? 'text' : 'password'}
+                  value={row.value}
+                  onChange={(e) => handleRowChange(row.id, 'value', e.target.value)}
+                  placeholder="Secret value"
+                  aria-label="Secret value"
+                  autoCorrect="off"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="flex-1 min-w-0 h-10 px-2.5 rounded-xl border border-black/[0.11] bg-[#FAFAFC] font-mono text-[12px] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
+                />
 
+                <button
+                  type="button"
+                  onClick={() =>
+                    setRevealedIds((prev) => ({
+                      ...prev,
+                      [row.id]: !prev[row.id],
+                    }))
+                  }
+                  aria-label={isRevealed ? 'Hide secret value' : 'Reveal secret value'}
+                  className="w-8 h-9 rounded-lg flex items-center justify-center text-[#52525B] hover:bg-black/[0.04] hover:text-[#0B0B0F] shrink-0 transition-colors"
+                >
+                  {isRevealed ? (
+                    <EyeOff className="w-4 h-4" />
+                  ) : (
+                    <Eye className="w-4 h-4" />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleCopyValue(row)}
+                  disabled={!row.value}
+                  aria-label="Copy secret value"
+                  className="w-8 h-9 rounded-lg flex items-center justify-center text-[#52525B] hover:bg-black/[0.04] hover:text-[#0B0B0F] disabled:opacity-35 shrink-0 transition-colors"
+                >
+                  {isCopied ? (
+                    <Check className="w-4 h-4 text-[#6D4AFF]" />
+                  ) : (
+                    <Copy className="w-4 h-4" />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleDeleteRow(row.id)}
+                  aria-label="Remove secret row"
+                  className="w-8 h-9 rounded-lg flex items-center justify-center text-[#71717A] hover:bg-red-50 hover:text-red-600 shrink-0 transition-colors"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* + Add secret button on left */}
+        <div className="flex items-center justify-between gap-2">
           <button
-            type="submit"
-            className="w-full h-11 rounded-xl bg-[#0B0B0F] hover:bg-black/85 text-white text-[13.5px] font-medium flex items-center justify-center gap-2 active:scale-[0.99] transition-all"
+            type="button"
+            onClick={handleAddBlankRow}
+            className="inline-flex items-center gap-1.5 h-10 px-4 rounded-xl border border-black/[0.11] bg-white hover:bg-[#F7F7FA] text-[13px] font-medium text-[#0B0B0F] active:scale-[0.98] transition-all"
           >
-            <Plus className="w-4 h-4" />
-            <span>Save Secret</span>
+            <Plus className="w-4 h-4 text-[#6D4AFF]" />
+            <span>Add secret</span>
           </button>
-        </form>
+
+          <span className="text-[12px] text-[#71717A] tabular-nums">
+            {rows.filter((r) => r.key.trim() || r.value.trim()).length} configured
+          </span>
+        </div>
+
+        {errorMsg && (
+          <p
+            role="alert"
+            className="px-3 py-2 rounded-xl bg-red-50 border border-red-200 text-red-700 text-[12.5px] font-medium"
+          >
+            {errorMsg}
+          </p>
+        )}
 
         {feedback && (
           <p
@@ -364,187 +565,94 @@ export function ProjectSecretsModal({
           </p>
         )}
 
-        <div className="border-t border-black/[0.06] pt-4 flex flex-col gap-3">
-          <div className="flex items-center justify-between text-[12.5px]">
-            <span className="font-semibold text-[#0B0B0F]">
-              Saved for {projectTitle}
-            </span>
-            <span className="text-[#71717A] tabular-nums">
-              {secrets.length} {secrets.length === 1 ? 'key' : 'keys'}
-            </span>
+        <div className="border-t border-black/[0.06]" />
+
+        {/* Info Banner matching reference */}
+        <div className="rounded-2xl border border-black/[0.09] bg-[#FAFAFC] px-3.5 py-3 flex flex-col gap-2">
+          <div className="flex items-start gap-2.5">
+            <Lightbulb className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+            <p className="text-[12.5px] leading-snug text-[#18181B]">
+              How are secrets handled when sharing?{' '}
+              <button
+                type="button"
+                onClick={() => setShowShareInfo((v) => !v)}
+                className="font-semibold text-[#6D4AFF] hover:underline"
+              >
+                {showShareInfo ? 'Hide details' : 'Learn more'}
+              </button>
+            </p>
           </div>
-
-          {secrets.length === 0 ? (
-            <div className="py-5 px-4 rounded-2xl bg-[#FAFAFC] border border-black/[0.06] text-center">
-              <p className="text-[13px] font-medium text-[#18181B]">
-                No secrets added for this app yet
-              </p>
-              <p className="text-[12px] text-[#71717A] mt-1 leading-relaxed">
-                Add API keys here whenever this app needs credentials. They are injected automatically at runtime via{' '}
-                <code className="font-mono text-[#3F3F46]">window.AICraft.env</code>.
-              </p>
-            </div>
-          ) : (
-            <ul className="divide-y divide-black/[0.06] border border-black/[0.07] rounded-2xl overflow-hidden">
-              {secrets.map((item) => {
-                const isRevealed = Boolean(revealedIds[item.id]);
-                const isEditing = editingId === item.id;
-
-                return (
-                  <li key={item.id} className="px-3.5 py-3 bg-white">
-                    {isEditing ? (
-                      <div className="flex flex-col gap-2">
-                        <input
-                          type="text"
-                          value={editKey}
-                          onChange={(e) => setEditKey(e.target.value)}
-                          spellCheck={false}
-                          className="w-full h-10 px-3 rounded-lg border border-black/[0.14] font-mono text-[12.5px] text-[#0B0B0F] focus:outline-none focus:border-[#6D4AFF]"
-                        />
-                        <div className="relative flex items-center">
-                          <input
-                            type={showEditValue ? 'text' : 'password'}
-                            value={editValue}
-                            onChange={(e) => setEditValue(e.target.value)}
-                            spellCheck={false}
-                            className="w-full h-10 pl-3 pr-10 rounded-lg border border-black/[0.14] font-mono text-[12.5px] text-[#0B0B0F] focus:outline-none focus:border-[#6D4AFF]"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setShowEditValue((v) => !v)}
-                            aria-label="Toggle edit secret visibility"
-                            className="absolute right-1 min-w-[36px] min-h-[36px] flex items-center justify-center text-[#71717A]"
-                          >
-                            {showEditValue ? (
-                              <EyeOff className="w-4 h-4" />
-                            ) : (
-                              <Eye className="w-4 h-4" />
-                            )}
-                          </button>
-                        </div>
-                        <div className="flex items-center justify-end gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setEditingId(null)}
-                            className="h-9 px-3 rounded-lg border border-black/[0.1] text-xs font-medium text-[#52525B]"
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleSaveEdit(item.id)}
-                            className="h-9 px-3.5 rounded-lg bg-[#6D4AFF] text-white text-xs font-medium"
-                          >
-                            Save
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="min-w-0 flex-1">
-                          <p className="font-mono text-[12.5px] font-semibold text-[#0B0B0F] truncate">
-                            {item.key}
-                          </p>
-                          <p className="font-mono text-[12px] text-[#71717A] truncate mt-0.5">
-                            {isRevealed ? item.value : maskSecretValue(item.value)}
-                          </p>
-                        </div>
-
-                        <div className="flex items-center gap-0.5 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setRevealedIds((prev) => ({
-                                ...prev,
-                                [item.id]: !prev[item.id],
-                              }))
-                            }
-                            aria-label={isRevealed ? `Hide ${item.key}` : `Reveal ${item.key}`}
-                            className="min-w-[40px] min-h-[40px] rounded-lg flex items-center justify-center text-[#52525B] hover:bg-black/[0.04]"
-                          >
-                            {isRevealed ? (
-                              <EyeOff className="w-4 h-4" />
-                            ) : (
-                              <Eye className="w-4 h-4" />
-                            )}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => startEditing(item)}
-                            aria-label={`Edit ${item.key}`}
-                            className="min-w-[40px] min-h-[40px] rounded-lg flex items-center justify-center text-[#52525B] hover:bg-black/[0.04]"
-                          >
-                            <Pencil className="w-4 h-4" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleDelete(item.id, item.key)}
-                            aria-label={`Delete ${item.key}`}
-                            className="min-w-[40px] min-h-[40px] rounded-lg flex items-center justify-center text-red-600 hover:bg-red-50"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
+          {showShareInfo && (
+            <p className="pl-6 text-[12px] leading-relaxed text-[#52525B]">
+              Secrets stay isolated to <span className="font-medium text-[#0B0B0F]">{projectTitle}</span> and
+              are injected automatically at runtime via{' '}
+              <code className="font-mono text-[#3F3F46]">window.AICraft.getSecret(&quot;KEY&quot;)</code>,{' '}
+              <code className="font-mono text-[#3F3F46]">window.ENV</code>, and{' '}
+              <code className="font-mono text-[#3F3F46]">process.env</code>. Public share links never expose your raw secret values.
+            </p>
           )}
-
-          <p className="text-[11.5px] text-[#71717A] leading-relaxed">
-            Automatically injected into this app&apos;s Preview runtime via{' '}
-            <code className="font-mono text-[#3F3F46]">window.AICraft.getSecret(&quot;KEY&quot;)</code>,{' '}
-            <code className="font-mono text-[#3F3F46]">window.ENV</code>, and{' '}
-            <code className="font-mono text-[#3F3F46]">process.env</code>.
-          </p>
         </div>
+
+        {/* Apply changes primary brand button */}
+        <button
+          type="button"
+          onClick={handleApplyChanges}
+          className="w-full h-11 rounded-xl bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-[13.5px] font-semibold flex items-center justify-center gap-2 shadow-[0_4px_14px_rgba(109,74,255,0.26)] active:scale-[0.99] transition-all"
+        >
+          <Save className="w-4 h-4" />
+          <span>Apply changes</span>
+        </button>
       </div>
     </DrawerShell>
   );
 }
 
 /* -------------------------------------------------------------------------- */
-/* 2. Per-Project Database Configuration & Schema View                        */
+/* 2. Per-Project Automatic Real-Time Structured Database Explorer            */
 /* -------------------------------------------------------------------------- */
 
 interface ProjectDatabaseModalProps {
   open: boolean;
   projectId: string;
   projectTitle: string;
+  hasBuiltApp: boolean;
+  isStreaming: boolean;
   latestPreviewHtml: string;
   databaseConfig: ProjectDatabaseConfig;
   onClose: () => void;
-  onUpdateDatabase: (next: ProjectDatabaseConfig) => void;
-  onApplySchemaWithAi: (promptText: string) => void;
 }
 
 export function ProjectDatabaseModal({
   open,
   projectId,
   projectTitle,
+  hasBuiltApp,
+  isStreaming,
   latestPreviewHtml,
   databaseConfig,
   onClose,
-  onUpdateDatabase,
-  onApplySchemaWithAi,
 }: ProjectDatabaseModalProps) {
-  const [activeTab, setActiveTab] = useState<'schema' | 'data' | 'connection'>('schema');
-  const [tableName, setTableName] = useState('');
-  const [columnsInput, setColumnsInput] = useState('id, title, status, created_at');
-  const [apiUrlInput, setApiUrlInput] = useState(databaseConfig.apiUrl || '');
   const [copiedSqlId, setCopiedSqlId] = useState<string | null>(null);
+  const [collapsedTables, setCollapsedTables] = useState<Record<string, boolean>>({});
   const [feedback, setFeedback] = useState<string | null>(null);
   const [dataRefreshTick, setDataRefreshTick] = useState(0);
 
   useEffect(() => {
-    setApiUrlInput(databaseConfig.apiUrl || '');
-  }, [databaseConfig.apiUrl, open]);
+    if (!open) return;
+    setDataRefreshTick((n) => n + 1);
+    const handleDbUpdate = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ projectId?: string }>).detail;
+      if (!detail?.projectId || detail.projectId === projectId) {
+        setDataRefreshTick((n) => n + 1);
+      }
+    };
+    window.addEventListener('aicraft:db-updated', handleDbUpdate);
+    return () => window.removeEventListener('aicraft:db-updated', handleDbUpdate);
+  }, [open, projectId]);
 
   useEffect(() => {
     if (!feedback) return;
-    const t = window.setTimeout(() => setFeedback(null), 2600);
+    const t = window.setTimeout(() => setFeedback(null), 2400);
     return () => window.clearTimeout(t);
   }, [feedback]);
 
@@ -553,106 +661,119 @@ export function ProjectDatabaseModal({
     [latestPreviewHtml]
   );
 
-  const liveStoredTables = useMemo(() => {
-    if (!open) return [];
+  const liveStoredMap = useMemo(() => {
+    const map = new Map<string, { storageKey: string; rows: Record<string, unknown>[] }>();
+    if (!open) return map;
     const prefix = `aicraft_db_${projectId}_`;
-    const items: Array<{ key: string; name: string; rows: unknown[] }> = [];
+
     try {
       for (let i = 0; i < window.localStorage.length; i += 1) {
         const key = window.localStorage.key(i);
         if (!key) continue;
+
+        let tableName = '';
         if (key.startsWith(prefix)) {
-          const raw = window.localStorage.getItem(key);
-          const parsed = raw ? (JSON.parse(raw) as unknown) : [];
-          items.push({
-            key,
-            name: key.slice(prefix.length),
-            rows: Array.isArray(parsed) ? parsed : [parsed],
-          });
+          tableName = sanitizeTableName(key.slice(prefix.length));
         } else if (detected.storageKeys.includes(key)) {
-          const raw = window.localStorage.getItem(key);
-          let parsed: unknown = raw;
-          try {
-            parsed = raw ? JSON.parse(raw) : [];
-          } catch {
-            parsed = raw ? [raw] : [];
-          }
-          items.push({
-            key,
-            name: key,
-            rows: Array.isArray(parsed) ? parsed : [parsed],
-          });
+          tableName = sanitizeTableName(key);
+        } else {
+          continue;
         }
+
+        if (!tableName) continue;
+        const raw = window.localStorage.getItem(key);
+        let parsed: unknown = [];
+        try {
+          parsed = raw ? JSON.parse(raw) : [];
+        } catch {
+          parsed = raw ? [{ value: raw }] : [];
+        }
+        const rawArray = Array.isArray(parsed)
+          ? parsed
+          : parsed && typeof parsed === 'object'
+            ? [parsed]
+            : [];
+        const normalizedRows = rawArray.map((item, idx) =>
+          item && typeof item === 'object' && !Array.isArray(item)
+            ? (item as Record<string, unknown>)
+            : { id: `row_${idx + 1}`, value: item }
+        );
+        map.set(tableName, { storageKey: key, rows: normalizedRows });
       }
     } catch {
       // ignore localStorage read failure
     }
-    return items;
+    return map;
   }, [open, projectId, detected.storageKeys, dataRefreshTick]);
 
-  const handleAddTable = (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleaned = sanitizeTableName(tableName);
-    if (!cleaned) {
-      setFeedback('Enter a table name (e.g. users, orders, tasks).');
-      return;
-    }
-    if (databaseConfig.tables.some((t) => t.name === cleaned)) {
-      setFeedback(`Table "${cleaned}" already exists.`);
-      return;
-    }
+  const structuredTables = useMemo(() => {
+    const merged = new Map<string, ProjectDatabaseTable>();
 
-    const columns: ProjectDatabaseColumn[] = columnsInput
-      .split(',')
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .map((part) => {
-        const [rawCol, rawType] = part.split(':').map((s) => s.trim());
-        const colName = sanitizeTableName(rawCol || '');
-        const colType: ProjectDatabaseColumn['type'] =
-          rawType === 'number' ||
-          rawType === 'boolean' ||
-          rawType === 'timestamp' ||
-          rawType === 'json'
-            ? rawType
-            : colName === 'created_at' || colName === 'updated_at'
-              ? 'timestamp'
-              : colName === 'amount' || colName === 'price' || colName === 'count'
-                ? 'number'
-                : 'text';
-        return { name: colName, type: colType, required: colName === 'id' };
-      })
-      .filter((c) => c.name.length > 0);
-
-    const nextTable: ProjectDatabaseTable = {
-      id: `tbl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      name: cleaned,
-      columns:
-        columns.length > 0
-          ? columns
-          : [
-              { name: 'id', type: 'text', required: true },
-              { name: 'created_at', type: 'timestamp' },
-            ],
+    const upsertTable = (table: ProjectDatabaseTable) => {
+      const cleanName = sanitizeTableName(table.name);
+      if (!cleanName) return;
+      const existing = merged.get(cleanName);
+      if (!existing) {
+        merged.set(cleanName, {
+          ...table,
+          name: cleanName,
+          columns: [...table.columns],
+        });
+        return;
+      }
+      const colNames = new Set(existing.columns.map((c) => c.name));
+      for (const col of table.columns) {
+        if (!colNames.has(col.name)) {
+          colNames.add(col.name);
+          existing.columns.push(col);
+        }
+      }
     };
 
-    onUpdateDatabase({
-      ...databaseConfig,
-      enabled: true,
-      tables: [...databaseConfig.tables, nextTable],
-      updatedAt: new Date().toISOString(),
-    });
-    setTableName('');
-    setFeedback(`Created table "${cleaned}".`);
-  };
+    for (const tbl of databaseConfig.tables) {
+      upsertTable(tbl);
+    }
+    for (const tbl of detected.tables) {
+      upsertTable(tbl);
+    }
+    for (const [tableName, store] of liveStoredMap.entries()) {
+      const inferredCols: ProjectDatabaseColumn[] = [];
+      const seenCols = new Set<string>();
+      for (const row of store.rows.slice(0, 10)) {
+        for (const [k, v] of Object.entries(row)) {
+          const cleanCol = sanitizeTableName(k);
+          if (!cleanCol || seenCols.has(cleanCol)) continue;
+          seenCols.add(cleanCol);
+          inferredCols.push({
+            name: cleanCol,
+            type: inferColumnTypeFromValue(v, cleanCol),
+            required: cleanCol === 'id',
+          });
+        }
+      }
+      upsertTable({
+        id: `live-${tableName}`,
+        name: tableName,
+        columns:
+          inferredCols.length > 0
+            ? inferredCols
+            : [
+                { name: 'id', type: 'text', required: true },
+                { name: 'created_at', type: 'timestamp' },
+              ],
+      });
+    }
 
-  const handleDeleteTable = (id: string) => {
-    onUpdateDatabase({
-      ...databaseConfig,
-      tables: databaseConfig.tables.filter((t) => t.id !== id),
-      updatedAt: new Date().toISOString(),
-    });
-  };
+    return Array.from(merged.values());
+  }, [databaseConfig.tables, detected.tables, liveStoredMap]);
+
+  const totalLiveRows = useMemo(() => {
+    let count = 0;
+    for (const store of liveStoredMap.values()) {
+      count += store.rows.length;
+    }
+    return count;
+  }, [liveStoredMap]);
 
   const buildCreateSql = (table: ProjectDatabaseTable): string => {
     const colLines = table.columns.map((c) => {
@@ -683,27 +804,17 @@ export function ProjectDatabaseModal({
     }
   };
 
-  const handleSaveConnection = (e: React.FormEvent) => {
-    e.preventDefault();
-    onUpdateDatabase({
-      ...databaseConfig,
-      apiUrl: apiUrlInput.trim(),
-      updatedAt: new Date().toISOString(),
-    });
-    setFeedback('Database connection saved.');
-  };
-
-  const handleApplyToApp = () => {
-    const tableList = databaseConfig.tables
-      .map(
-        (t) =>
-          `${t.name} (${t.columns.map((c) => `${c.name}:${c.type}`).join(', ')})`
-      )
-      .join('; ');
-    onClose();
-    onApplySchemaWithAi(
-      `Connect this app to persistent database storage using these tables: ${tableList}. Persist records using window.AICraft.db so data survives reloads.`
-    );
+  const handleClearTableRows = (tableName: string, storageKey: string) => {
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify([]));
+      setDataRefreshTick((n) => n + 1);
+      window.dispatchEvent(
+        new CustomEvent('aicraft:db-updated', { detail: { projectId, table: tableName } })
+      );
+      setFeedback(`Cleared records in "${tableName}".`);
+    } catch {
+      // ignore storage error
+    }
   };
 
   return (
@@ -711,34 +822,10 @@ export function ProjectDatabaseModal({
       open={open}
       onClose={onClose}
       title="Database"
-      subtitle={`Schema & Storage · ${projectTitle}`}
+      subtitle={`Real-time structured storage · ${projectTitle}`}
       icon={<Database className="w-[18px] h-[18px] text-[#6D4AFF]" />}
     >
-      <div className="flex flex-col gap-4">
-        {/* Segmented Control Tabs */}
-        <div className="grid grid-cols-3 gap-1 p-1 rounded-xl bg-[#F4F4F6]">
-          {(
-            [
-              { id: 'schema', label: 'Schema' },
-              { id: 'data', label: 'Live Data' },
-              { id: 'connection', label: 'Settings' },
-            ] as const
-          ).map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              onClick={() => setActiveTab(tab.id)}
-              className={`min-h-[36px] rounded-lg text-[12.5px] font-medium transition-colors ${
-                activeTab === tab.id
-                  ? 'bg-white text-[#0B0B0F] shadow-sm'
-                  : 'text-[#52525B] hover:text-[#0B0B0F]'
-              }`}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-
+      <div className="flex flex-col gap-3.5">
         {feedback && (
           <p
             role="status"
@@ -748,239 +835,198 @@ export function ProjectDatabaseModal({
           </p>
         )}
 
-        {activeTab === 'schema' && (
-          <div className="flex flex-col gap-4">
-            <div className="flex items-center justify-between px-3.5 py-3 rounded-2xl bg-[#FAFAFC] border border-black/[0.06]">
-              <div>
-                <p className="text-[13.5px] font-semibold text-[#0B0B0F]">
-                  App Data Persistence
-                </p>
-                <p className="text-[12px] text-[#71717A] mt-0.5">
-                  {databaseConfig.providerLabel} ·{' '}
-                  {databaseConfig.enabled ? 'Enabled' : 'Disabled'}
-                </p>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={databaseConfig.enabled}
-                onClick={() =>
-                  onUpdateDatabase({
-                    ...databaseConfig,
-                    enabled: !databaseConfig.enabled,
-                    updatedAt: new Date().toISOString(),
-                  })
-                }
-                className={`relative w-12 h-7 rounded-full transition-colors ${
-                  databaseConfig.enabled ? 'bg-[#6D4AFF]' : 'bg-[#D4D4D8]'
-                }`}
-              >
+        {structuredTables.length === 0 ? (
+          <div className="py-8 px-5 rounded-2xl bg-[#FAFAFC] border border-black/[0.06] text-center flex flex-col items-center gap-2.5">
+            <div className="w-11 h-11 rounded-2xl bg-[#F3F0FF] text-[#6D4AFF] flex items-center justify-center">
+              <Database className="w-5 h-5" />
+            </div>
+            <p className="text-[14px] font-semibold text-[#0B0B0F]">
+              {isStreaming
+                ? 'Listening for database tables...'
+                : 'No database built yet'}
+            </p>
+            <p className="text-[12.5px] text-[#71717A] leading-relaxed max-w-[320px]">
+              {isStreaming
+                ? 'As AI Craft designs your app, structured tables and live records will appear here automatically in real time.'
+                : hasBuiltApp
+                  ? 'This app does not store structured tables yet. Ask the AI to add persistent data (like profiles, posts, orders, or saved items) and it will structure tables here automatically.'
+                  : 'Ask AI Craft to build an app first. Any database tables created for your app will structure and update here automatically in real time.'}
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Live Summary Bar */}
+            <div className="flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-2xl bg-[#FAFAFC] border border-black/[0.06]">
+              <div className="flex items-center gap-2 min-w-0">
                 <span
-                  className={`absolute top-1 left-1 w-5 h-5 rounded-full bg-white shadow transition-transform ${
-                    databaseConfig.enabled ? 'translate-x-5' : 'translate-x-0'
+                  aria-hidden="true"
+                  className={`w-2 h-2 rounded-full shrink-0 ${
+                    isStreaming ? 'bg-[#6D4AFF] animate-pulse' : 'bg-emerald-500'
                   }`}
                 />
-              </button>
-            </div>
-
-            {detected.dbTables.length > 0 && (
-              <div className="px-3.5 py-2.5 rounded-xl bg-emerald-50/70 border border-emerald-200/80 text-[12px] text-emerald-900">
-                <span className="font-semibold">Detected in app code:</span>{' '}
-                <span className="font-mono">{detected.dbTables.join(', ')}</span>
-              </div>
-            )}
-
-            <form onSubmit={handleAddTable} className="flex flex-col gap-2">
-              <label className="text-[12px] font-medium text-[#52525B]">
-                Add Table to Project Schema
-              </label>
-              <input
-                type="text"
-                value={tableName}
-                onChange={(e) => setTableName(e.target.value)}
-                placeholder="Table name (e.g. users, orders, bookings)"
-                className="w-full h-11 px-3.5 rounded-xl border border-black/[0.12] bg-[#FAFAFC] font-mono text-[13px] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
-              />
-              <input
-                type="text"
-                value={columnsInput}
-                onChange={(e) => setColumnsInput(e.target.value)}
-                placeholder="Columns: id, name:text, amount:number, created_at"
-                className="w-full h-11 px-3.5 rounded-xl border border-black/[0.12] bg-[#FAFAFC] font-mono text-[12.5px] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
-              />
-              <button
-                type="submit"
-                className="w-full h-11 rounded-xl bg-[#0B0B0F] hover:bg-black/85 text-white text-[13.5px] font-medium flex items-center justify-center gap-2 active:scale-[0.99] transition-all"
-              >
-                <Plus className="w-4 h-4" />
-                <span>Create Table</span>
-              </button>
-            </form>
-
-            <div className="border-t border-black/[0.06] pt-3 flex flex-col gap-2.5">
-              <div className="flex items-center justify-between text-[12.5px]">
-                <span className="font-semibold text-[#0B0B0F]">Project Tables</span>
-                <span className="text-[#71717A] tabular-nums">
-                  {databaseConfig.tables.length}{' '}
-                  {databaseConfig.tables.length === 1 ? 'table' : 'tables'}
+                <span className="text-[12.5px] font-semibold text-[#0B0B0F] tabular-nums truncate">
+                  {structuredTables.length}{' '}
+                  {structuredTables.length === 1 ? 'table' : 'tables'} ·{' '}
+                  {totalLiveRows} {totalLiveRows === 1 ? 'record' : 'records'}
                 </span>
               </div>
 
-              {databaseConfig.tables.length === 0 ? (
-                <p className="text-[12.5px] text-[#71717A] py-3">
-                  No custom schema tables defined yet. Create a table above to structure this app&apos;s data.
-                </p>
-              ) : (
-                <ul className="divide-y divide-black/[0.06] border border-black/[0.07] rounded-2xl overflow-hidden">
-                  {databaseConfig.tables.map((tbl) => (
-                    <li key={tbl.id} className="px-3.5 py-3 bg-white flex flex-col gap-1.5">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="font-mono text-[13px] font-semibold text-[#0B0B0F]">
-                          {tbl.name}
-                        </span>
-                        <div className="flex items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => void handleCopySql(tbl)}
-                            className="h-8 px-2.5 rounded-lg border border-black/[0.08] text-[11.5px] font-medium text-[#3F3F46] hover:bg-black/[0.03] flex items-center gap-1"
-                          >
-                            {copiedSqlId === tbl.id ? (
-                              <>
-                                <Check className="w-3 h-3 text-[#6D4AFF]" />
-                                <span>SQL Copied</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3 h-3" />
-                                <span>Copy SQL</span>
-                              </>
-                            )}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteTable(tbl.id)}
-                            aria-label={`Delete table ${tbl.name}`}
-                            className="min-w-[36px] min-h-[36px] rounded-lg flex items-center justify-center text-red-600 hover:bg-red-50"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-                      <p className="font-mono text-[11.5px] text-[#71717A] leading-relaxed">
-                        {tbl.columns.map((c) => `${c.name}: ${c.type}`).join(' · ')}
-                      </p>
-                    </li>
-                  ))}
-                </ul>
-              )}
-
-              {databaseConfig.tables.length > 0 && (
-                <button
-                  type="button"
-                  onClick={handleApplyToApp}
-                  className="mt-1 w-full h-11 rounded-xl bg-[#6D4AFF] hover:bg-[#5B35F5] text-white text-[13.5px] font-medium flex items-center justify-center gap-2 active:scale-[0.99] transition-all"
-                >
-                  <Database className="w-4 h-4" />
-                  <span>Wire Schema Into App</span>
-                </button>
-              )}
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'data' && (
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center justify-between text-[12.5px]">
-              <span className="font-semibold text-[#0B0B0F]">
-                Stored Records ({liveStoredTables.length})
-              </span>
               <button
                 type="button"
                 onClick={() => setDataRefreshTick((n) => n + 1)}
-                className="text-[12px] font-medium text-[#6D4AFF] hover:opacity-80"
+                className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg border border-black/[0.08] bg-white hover:bg-black/[0.03] text-[12px] font-medium text-[#3F3F46] active:scale-95 transition-all shrink-0"
               >
-                Refresh
+                <RefreshCw className="w-3.5 h-3.5 text-[#6D4AFF]" />
+                <span>Refresh</span>
               </button>
             </div>
 
-            {liveStoredTables.length === 0 ? (
-              <div className="py-6 px-4 rounded-2xl bg-[#FAFAFC] border border-black/[0.06] text-center">
-                <p className="text-[13px] font-medium text-[#18181B]">
-                  No records stored yet
-                </p>
-                <p className="text-[12px] text-[#71717A] mt-1">
-                  Records saved by your Preview app via{' '}
-                  <code className="font-mono">window.AICraft.db</code> or{' '}
-                  <code className="font-mono">localStorage</code> appear here.
-                </p>
-              </div>
-            ) : (
-              <div className="flex flex-col gap-3">
-                {liveStoredTables.map((store) => (
+            {/* Structured Database Tables */}
+            <div className="flex flex-col gap-3">
+              {structuredTables.map((table) => {
+                const store = liveStoredMap.get(table.name);
+                const rows = store?.rows ?? [];
+                const isCollapsed = Boolean(collapsedTables[table.name]);
+
+                return (
                   <div
-                    key={store.key}
+                    key={table.id}
                     className="rounded-2xl border border-black/[0.08] bg-white overflow-hidden"
                   >
                     <div className="px-3.5 py-2.5 bg-[#FAFAFC] border-b border-black/[0.06] flex items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <span className="font-mono text-[12.5px] font-semibold text-[#0B0B0F]">
-                          {store.name}
-                        </span>
-                        <span className="ml-2 text-[11.5px] text-[#71717A] tabular-nums">
-                          {store.rows.length} {store.rows.length === 1 ? 'row' : 'rows'}
-                        </span>
-                      </div>
                       <button
                         type="button"
-                        onClick={() => {
-                          try {
-                            window.localStorage.removeItem(store.key);
-                            setDataRefreshTick((n) => n + 1);
-                            setFeedback(`Cleared ${store.name}.`);
-                          } catch {
-                            // ignore storage failure
-                          }
-                        }}
-                        className="text-[11.5px] font-medium text-red-600 hover:opacity-80"
+                        onClick={() =>
+                          setCollapsedTables((prev) => ({
+                            ...prev,
+                            [table.name]: !prev[table.name],
+                          }))
+                        }
+                        className="flex items-center gap-2 min-w-0 text-left flex-1"
                       >
-                        Clear
+                        {isCollapsed ? (
+                          <ChevronRight className="w-4 h-4 text-[#71717A] shrink-0" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4 text-[#71717A] shrink-0" />
+                        )}
+                        <span className="font-mono text-[13px] font-semibold text-[#0B0B0F] truncate">
+                          {table.name}
+                        </span>
+                        <span className="text-[11.5px] text-[#71717A] tabular-nums whitespace-nowrap">
+                          {table.columns.length} cols · {rows.length}{' '}
+                          {rows.length === 1 ? 'row' : 'rows'}
+                        </span>
                       </button>
-                    </div>
-                    <pre className="p-3 text-[11px] font-mono text-[#3F3F46] max-h-40 overflow-auto whitespace-pre-wrap break-words">
-                      {JSON.stringify(store.rows.slice(0, 15), null, 2)}
-                    </pre>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
 
-        {activeTab === 'connection' && (
-          <form onSubmit={handleSaveConnection} className="flex flex-col gap-3">
-            <div className="px-3.5 py-3 rounded-2xl bg-[#FAFAFC] border border-black/[0.06] text-[12.5px] text-[#52525B] leading-relaxed">
-              Your project automatically includes built-in local &amp; cloud persistence via{' '}
-              <code className="font-mono text-[#0B0B0F]">window.AICraft.db</code>. Optionally attach a custom PostgreSQL / Supabase endpoint URL for this project below.
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => void handleCopySql(table)}
+                          className="h-7 px-2 rounded-lg border border-black/[0.08] bg-white text-[11px] font-medium text-[#3F3F46] hover:bg-black/[0.03] flex items-center gap-1"
+                        >
+                          {copiedSqlId === table.id ? (
+                            <>
+                              <Check className="w-3 h-3 text-[#6D4AFF]" />
+                              <span>SQL</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3 h-3" />
+                              <span>SQL</span>
+                            </>
+                          )}
+                        </button>
+
+                        {rows.length > 0 && store && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleClearTableRows(table.name, store.storageKey)
+                            }
+                            aria-label={`Clear ${table.name} records`}
+                            className="h-7 px-2 rounded-lg text-[11px] font-medium text-red-600 hover:bg-red-50"
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {!isCollapsed && (
+                      <div className="flex flex-col divide-y divide-black/[0.06]">
+                        {/* Columns Structure */}
+                        <div className="p-3 bg-white">
+                          <div className="flex flex-wrap gap-1.5">
+                            {table.columns.map((col) => (
+                              <div
+                                key={`${table.name}-${col.name}`}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#F7F7FA] border border-black/[0.06]"
+                              >
+                                <span className="font-mono text-[11.5px] font-medium text-[#0B0B0F]">
+                                  {col.name}
+                                </span>
+                                <span className="text-[10.5px] font-mono text-[#6D4AFF]">
+                                  {col.type}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Live Records Preview */}
+                        {rows.length > 0 ? (
+                          <div className="max-h-44 overflow-auto bg-white">
+                            <table className="w-full text-left border-collapse text-[11.5px] font-mono">
+                              <thead className="bg-[#FAFAFC] text-[#52525B] sticky top-0 border-b border-black/[0.06]">
+                                <tr>
+                                  {table.columns.slice(0, 5).map((col) => (
+                                    <th
+                                      key={col.name}
+                                      className="px-3 py-1.5 font-semibold whitespace-nowrap"
+                                    >
+                                      {col.name}
+                                    </th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-black/[0.05] text-[#18181B]">
+                                {rows.slice(0, 12).map((row, idx) => (
+                                  <tr key={String(row.id ?? idx)}>
+                                    {table.columns.slice(0, 5).map((col) => {
+                                      const rawCell = row[col.name];
+                                      const cellStr =
+                                        rawCell === null || rawCell === undefined
+                                          ? '—'
+                                          : typeof rawCell === 'object'
+                                            ? JSON.stringify(rawCell)
+                                            : String(rawCell);
+                                      return (
+                                        <td
+                                          key={col.name}
+                                          className="px-3 py-1.5 max-w-[140px] truncate"
+                                          title={cellStr}
+                                        >
+                                          {cellStr}
+                                        </td>
+                                      );
+                                    })}
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <p className="px-3.5 py-2.5 text-[11.5px] text-[#71717A]">
+                            Table ready — live records saved by this app in Preview appear here automatically.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
-            <div>
-              <label className="block text-[12px] font-medium text-[#52525B] mb-1.5">
-                Custom Database / API Endpoint (Optional)
-              </label>
-              <input
-                type="url"
-                value={apiUrlInput}
-                onChange={(e) => setApiUrlInput(e.target.value)}
-                placeholder="https://your-project.supabase.co"
-                className="w-full h-11 px-3.5 rounded-xl border border-black/[0.12] bg-[#FAFAFC] font-mono text-[12.5px] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none focus:border-[#6D4AFF] focus:bg-white"
-              />
-            </div>
-            <button
-              type="submit"
-              className="w-full h-11 rounded-xl bg-[#0B0B0F] hover:bg-black/85 text-white text-[13.5px] font-medium"
-            >
-              Save Connection Settings
-            </button>
-          </form>
+          </>
         )}
       </div>
     </DrawerShell>
