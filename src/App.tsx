@@ -25,6 +25,7 @@ import { TopBar } from './components/TopBar';
 import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
 import {
   AuthUser,
+  BillingSummary,
   BuildMode,
   BuilderTurn,
   ComposerOptions,
@@ -45,17 +46,27 @@ interface CraftProject {
   turns: BuilderTurn[];
 }
 
+interface CloudWorkspacePayload {
+  projects?: CraftProject[];
+  projectViews?: Record<string, WorkspaceView>;
+  publishedProjects?: Record<string, boolean>;
+  profile?: UserProfile;
+  updatedAt?: string;
+}
+
 const STORAGE_PROJECTS_KEY = 'aicraft_projects_v1';
 const STORAGE_VIEWS_KEY = 'aicraft_project_views_v1';
 const STORAGE_PUBLISHED_KEY = 'aicraft_published_v1';
 const STORAGE_MODEL_KEY = 'aicraft_selected_model_v1';
 const STORAGE_CREDITS_KEY = 'aicraft_credits_v1';
 const STORAGE_PRO_PLAN_KEY = 'aicraft_pro_plan_v1';
+const STORAGE_BILLING_KEY = 'aicraft_billing_v1';
 const STORAGE_PROFILE_KEY = 'aicraft_profile_v1';
 const STORAGE_NOTIFICATIONS_KEY = 'aicraft_notifications_v1';
 const STORAGE_AUTOREAD_KEY = 'aicraft_autoread_v1';
 const STORAGE_TRANSACTIONS_KEY = 'aicraft_transactions_v1';
 const STORAGE_CREDITED_REFS_KEY = 'aicraft_credited_refs_v1';
+const STORAGE_LAST_USER_KEY = 'aicraft_last_user_v1';
 
 function isProjectWorking(project: CraftProject | null | undefined): boolean {
   return Boolean(
@@ -132,11 +143,11 @@ function deriveProjectTitle(promptText: string, mode: BuildMode): string {
 function loadSavedCredits(): number {
   try {
     const raw = window.localStorage.getItem(STORAGE_CREDITS_KEY);
-    if (!raw) return 7;
+    if (!raw) return 300;
     const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 7;
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 300;
   } catch {
-    return 7;
+    return 300;
   }
 }
 
@@ -191,6 +202,42 @@ function loadStoredJson<T>(key: string): T | null {
   }
 }
 
+function getStoredAuthHeaders(): Record<string, string> {
+  const storedSession = loadStoredJson<StoredSupabaseSession>(STORAGE_SB_SESSION_KEY);
+  const headers: Record<string, string> = {};
+  if (storedSession?.accessToken) {
+    headers.Authorization = `Bearer ${storedSession.accessToken}`;
+  }
+  if (storedSession?.refreshToken) {
+    headers['x-refresh-token'] = storedSession.refreshToken;
+  }
+  return headers;
+}
+
+function mergeProjectsFromCloud(
+  localList: CraftProject[],
+  cloudList: CraftProject[]
+): CraftProject[] {
+  const mergedMap = new Map<string, CraftProject>();
+  for (const item of cloudList) {
+    if (item?.id && Array.isArray(item.turns)) {
+      mergedMap.set(item.id, item);
+    }
+  }
+  for (const localItem of localList) {
+    if (!localItem?.id || !Array.isArray(localItem.turns)) continue;
+    const existing = mergedMap.get(localItem.id);
+    if (!existing) {
+      mergedMap.set(localItem.id, localItem);
+    } else if (localItem.turns.length >= existing.turns.length) {
+      const localWorking = isProjectWorking(localItem);
+      const cloudComplete = existing.turns.some((t) => t.phase === 'complete');
+      mergedMap.set(localItem.id, localWorking && cloudComplete ? existing : localItem);
+    }
+  }
+  return Array.from(mergedMap.values());
+}
+
 export default function App() {
   const [recoveryTokens, setRecoveryTokens] = useState<StoredSupabaseSession | null>(() => {
     const params = new URLSearchParams(window.location.search);
@@ -207,8 +254,21 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('create');
   const [viewMode, setViewMode] = useState<'home' | 'builder'>('home');
   const [prompt, setPrompt] = useState('');
-  const [credits, setCredits] = useState<number>(() => loadSavedCredits());
+  const [billing, setBilling] = useState<BillingSummary | null>(() =>
+    loadStoredJson<BillingSummary>(STORAGE_BILLING_KEY)
+  );
+  const [credits, setCredits] = useState<number>(() => {
+    const savedBilling = loadStoredJson<BillingSummary>(STORAGE_BILLING_KEY);
+    if (savedBilling && typeof savedBilling.monthlyCreditsRemaining === 'number') {
+      return savedBilling.monthlyCreditsRemaining;
+    }
+    return loadSavedCredits();
+  });
   const [proPlanId, setProPlanId] = useState<string | null>(() => {
+    const savedBilling = loadStoredJson<BillingSummary>(STORAGE_BILLING_KEY);
+    if (savedBilling) {
+      return savedBilling.tier === 'free' ? null : savedBilling.tier;
+    }
     const saved = loadSavedString(STORAGE_PRO_PLAN_KEY);
     return saved || null;
   });
@@ -249,6 +309,46 @@ export default function App() {
   projectsRef.current = projects;
 
   const persistTimerRef = useRef<number | null>(null);
+  const cloudSyncTimerRef = useRef<number | null>(null);
+  const cloudHydratedUserRef = useRef<string | null>(null);
+
+  const applyBillingSummary = useCallback((summary: BillingSummary | null | undefined) => {
+    if (!summary) return;
+    setBilling(summary);
+    setCredits(summary.monthlyCreditsRemaining);
+    const nextPlan = summary.tier === 'free' ? null : summary.tier;
+    setProPlanId(nextPlan);
+    try {
+      window.localStorage.setItem(STORAGE_BILLING_KEY, JSON.stringify(summary));
+      window.localStorage.setItem(
+        STORAGE_CREDITS_KEY,
+        String(summary.monthlyCreditsRemaining)
+      );
+      if (nextPlan) {
+        window.localStorage.setItem(STORAGE_PRO_PLAN_KEY, nextPlan);
+      } else {
+        window.localStorage.removeItem(STORAGE_PRO_PLAN_KEY);
+      }
+    } catch {
+      // ignore storage write error
+    }
+  }, []);
+
+  const syncBillingFromServer = useCallback(async () => {
+    const headers = getStoredAuthHeaders();
+    if (!headers.Authorization && !headers['x-refresh-token']) return;
+    try {
+      const res = await fetch('/api/payments/billing', { headers });
+      if (!res.ok) return;
+      const raw = await res.text();
+      const data = raw ? (JSON.parse(raw) as { billing?: BillingSummary }) : {};
+      if (data.billing) {
+        applyBillingSummary(data.billing);
+      }
+    } catch {
+      // ignore network error
+    }
+  }, [applyBillingSummary]);
 
   const theme = MODE_THEMES[mode];
   const energyLevel = dynamicColorEnabled
@@ -381,11 +481,150 @@ export default function App() {
     try {
       if (proPlanId) {
         window.localStorage.setItem(STORAGE_PRO_PLAN_KEY, proPlanId);
+      } else {
+        window.localStorage.removeItem(STORAGE_PRO_PLAN_KEY);
       }
     } catch {
       // ignore storage failure
     }
   }, [proPlanId]);
+
+  const [cloudHydratedTick, setCloudHydratedTick] = useState(0);
+
+  useEffect(() => {
+    if (!authUser) return;
+    let cancelled = false;
+    const currentUserId = authUser.id;
+    const previousUserId = loadSavedString(STORAGE_LAST_USER_KEY);
+    const switchedAccount = Boolean(previousUserId && previousUserId !== currentUserId);
+
+    try {
+      window.localStorage.setItem(STORAGE_LAST_USER_KEY, currentUserId);
+    } catch {
+      // ignore storage failure
+    }
+
+    if (switchedAccount) {
+      setProjects([]);
+      setProjectViews({});
+      setPublishedProjects({});
+      setActiveProjectId(null);
+      setTransactions([]);
+      setBilling(null);
+      setProPlanId(null);
+      setCredits(300);
+    }
+
+    void syncBillingFromServer();
+
+    const hydrateCloudWorkspace = async () => {
+      if (cloudHydratedUserRef.current === currentUserId) return;
+      try {
+        const res = await fetch('/api/payments/sync', {
+          headers: getStoredAuthHeaders(),
+        });
+        if (cancelled) return;
+        if (!res.ok) {
+          cloudHydratedUserRef.current = currentUserId;
+          setCloudHydratedTick((n) => n + 1);
+          return;
+        }
+        const raw = await res.text();
+        const data = raw
+          ? (JSON.parse(raw) as {
+              synced?: boolean;
+              workspace?: CloudWorkspacePayload | null;
+            })
+          : {};
+        if (cancelled) return;
+        cloudHydratedUserRef.current = currentUserId;
+
+        if (data.synced && data.workspace) {
+          const ws = data.workspace;
+          if (Array.isArray(ws.projects) && ws.projects.length > 0) {
+            setProjects((prev) =>
+              switchedAccount
+                ? ws.projects!
+                : mergeProjectsFromCloud(prev, ws.projects!)
+            );
+          }
+          if (ws.projectViews && typeof ws.projectViews === 'object') {
+            setProjectViews((prev) =>
+              switchedAccount ? ws.projectViews! : { ...ws.projectViews!, ...prev }
+            );
+          }
+          if (ws.publishedProjects && typeof ws.publishedProjects === 'object') {
+            setPublishedProjects((prev) =>
+              switchedAccount
+                ? ws.publishedProjects!
+                : { ...ws.publishedProjects!, ...prev }
+            );
+          }
+          if (ws.profile && typeof ws.profile === 'object') {
+            setUserProfile((prev) => ({
+              name: ws.profile?.name || prev.name,
+              email: authUser.email || ws.profile?.email || prev.email,
+              avatarDataUrl: ws.profile?.avatarDataUrl ?? prev.avatarDataUrl,
+            }));
+          }
+        }
+        setCloudHydratedTick((n) => n + 1);
+      } catch {
+        // ignore cloud hydration error when offline
+      }
+    };
+
+    void hydrateCloudWorkspace();
+    return () => {
+      cancelled = true;
+    };
+  }, [authUser, syncBillingFromServer]);
+
+  // Debounced cross-device cloud sync for apps, views, published status, and profile
+  useEffect(() => {
+    if (!authUser || cloudHydratedUserRef.current !== authUser.id) return;
+    if (cloudSyncTimerRef.current !== null) {
+      window.clearTimeout(cloudSyncTimerRef.current);
+    }
+    const working = projects.some((p) => isProjectWorking(p));
+    cloudSyncTimerRef.current = window.setTimeout(() => {
+      cloudSyncTimerRef.current = null;
+      const headers = getStoredAuthHeaders();
+      if (!headers.Authorization && !headers['x-refresh-token']) return;
+
+      const compactProjects = projects.slice(0, 40).map((proj, idx) => ({
+        ...proj,
+        turns: proj.turns.map((turn) => ({
+          ...turn,
+          attachmentDataUrl: idx < 3 ? turn.attachmentDataUrl : null,
+        })),
+      }));
+
+      void fetch('/api/payments/sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...headers,
+        },
+        body: JSON.stringify({
+          projects: compactProjects,
+          projectViews,
+          publishedProjects,
+          profile: userProfile,
+          updatedAt: new Date().toISOString(),
+        }),
+      }).catch(() => {
+        // ignore background sync failure
+      });
+    }, working ? 4500 : 1400);
+
+    return () => {
+      if (cloudSyncTimerRef.current !== null) {
+        window.clearTimeout(cloudSyncTimerRef.current);
+        cloudSyncTimerRef.current = null;
+      }
+    };
+  }, [authUser, cloudHydratedTick, projects, projectViews, publishedProjects, userProfile]);
 
   useEffect(() => {
     try {
@@ -763,6 +1002,7 @@ export default function App() {
                     modelProvider: evt.provider ?? t.modelProvider,
                   };
                 });
+                void syncBillingFromServer();
                 if (
                   notificationsEnabled &&
                   document.visibilityState === 'hidden' &&
@@ -804,7 +1044,7 @@ export default function App() {
 
       return { sawTerminalEvent, latestJobId };
     },
-    [updateTurn]
+    [notificationsEnabled, syncBillingFromServer, updateTurn]
   );
 
   const runBuilderStream = useCallback(
@@ -833,7 +1073,10 @@ export default function App() {
 
         const response = await fetch('/api/craft/stream', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...getStoredAuthHeaders(),
+          },
           body: JSON.stringify({
             message,
             mode: targetMode,
@@ -850,10 +1093,20 @@ export default function App() {
         if (!response.ok || !response.body) {
           let errorText = 'Failed to connect to AI Craft.';
           try {
-            const errJson = (await response.json()) as { error?: string };
+            const errJson = (await response.json()) as {
+              error?: string;
+              billing?: BillingSummary;
+            };
+            if (errJson.billing) {
+              applyBillingSummary(errJson.billing);
+            }
             if (errJson.error) errorText = errJson.error;
           } catch {
             // ignore parse error
+          }
+          if (response.status === 402) {
+            setInlineNotice(errorText);
+            setShowProUpgrade(true);
           }
           throw new Error(errorText);
         }
@@ -913,7 +1166,7 @@ export default function App() {
         }
       }
     },
-    [consumeSseStream, updateTurn]
+    [applyBillingSummary, consumeSseStream, updateTurn]
   );
 
   const resumeJobStream = useCallback(
@@ -1127,6 +1380,7 @@ export default function App() {
         saveProjectsSafely(projectsRef.current);
       } else if (document.visibilityState === 'visible') {
         syncUnfinishedJobs(true);
+        void syncBillingFromServer();
       }
     };
 
@@ -1140,6 +1394,7 @@ export default function App() {
 
     const handleOnline = () => {
       syncUnfinishedJobs(true);
+      void syncBillingFromServer();
     };
 
     document.addEventListener('visibilitychange', handleVisibility);
@@ -1151,11 +1406,55 @@ export default function App() {
       window.removeEventListener('pagehide', handlePageHide);
       window.removeEventListener('online', handleOnline);
     };
-  }, [updateTurn]);
+  }, [syncBillingFromServer, updateTurn]);
 
   const handleModeChange = (nextMode: BuildMode) => {
     if (nextMode === mode) return;
     setMode(nextMode);
+  };
+
+  const checkCanConsumeCredit = (): boolean => {
+    if (credits <= 0) {
+      setInlineNotice(
+        proPlanId
+          ? 'Monthly credit limit reached. Wait for your 30-day cycle reset or upgrade your plan.'
+          : 'You have used all 300 free credits for this 30-day cycle. Upgrade to continue.'
+      );
+      setShowProUpgrade(true);
+      return false;
+    }
+
+    if (
+      billing?.dailyLimit !== null &&
+      billing?.dailyLimit !== undefined &&
+      billing.dailyCreditsUsed >= billing.dailyLimit
+    ) {
+      setInlineNotice(
+        `Daily limit reached (${billing.dailyLimit.toLocaleString()} credits/day on ${billing.planName}). Resets in 24 hours.`
+      );
+      setShowProUpgrade(true);
+      return false;
+    }
+
+    return true;
+  };
+
+  const applyOptimisticCreditSpend = () => {
+    setCredits((prev) => Math.max(0, prev - 1));
+    setBilling((prev) => {
+      if (!prev) return prev;
+      const updated: BillingSummary = {
+        ...prev,
+        dailyCreditsUsed: prev.dailyCreditsUsed + 1,
+        monthlyCreditsRemaining: Math.max(0, prev.monthlyCreditsRemaining - 1),
+      };
+      try {
+        window.localStorage.setItem(STORAGE_BILLING_KEY, JSON.stringify(updated));
+      } catch {
+        // ignore storage error
+      }
+      return updated;
+    });
   };
 
   // Immediately transforms to BuilderWorkspace when a message is sent from the first screen
@@ -1167,6 +1466,7 @@ export default function App() {
         ? `Build an app based on ${options.attachmentName}`
         : '');
     if (!trimmed) return;
+    if (!checkCanConsumeCredit()) return;
 
     unlockSpeechSynthesis();
 
@@ -1209,7 +1509,7 @@ export default function App() {
 
     setProjects((prev) => [newProject, ...prev]);
     setActiveProjectId(projectId);
-    setCredits((prev) => Math.max(0, prev - 1));
+    applyOptimisticCreditSpend();
     setPrompt('');
     setViewMode('builder');
 
@@ -1228,6 +1528,7 @@ export default function App() {
 
   const handleFollowUp = (message: string, options: ComposerOptions) => {
     if (!activeProject || isProjectWorking(activeProject)) return;
+    if (!checkCanConsumeCredit()) return;
 
     unlockSpeechSynthesis();
 
@@ -1271,7 +1572,7 @@ export default function App() {
         p.id === activeProject.id ? { ...p, turns: [...p.turns, newTurn] } : p
       )
     );
-    setCredits((prev) => Math.max(0, prev - 1));
+    applyOptimisticCreditSpend();
 
     void runBuilderStream(
       activeProject.id,
@@ -1294,47 +1595,60 @@ export default function App() {
     setShowProUpgrade(true);
   };
 
-  const applyVerifiedTransaction = useCallback((tx: PaymentTransaction) => {
-    setTransactions((prev) => {
-      const merged = [tx, ...prev.filter((item) => item.reference !== tx.reference)];
-      try {
-        window.localStorage.setItem(STORAGE_TRANSACTIONS_KEY, JSON.stringify(merged));
-      } catch {
-        // ignore storage write error
+  const applyVerifiedTransaction = useCallback(
+    (tx: PaymentTransaction, nextBilling?: BillingSummary | null) => {
+      setTransactions((prev) => {
+        const merged = [tx, ...prev.filter((item) => item.reference !== tx.reference)];
+        try {
+          window.localStorage.setItem(STORAGE_TRANSACTIONS_KEY, JSON.stringify(merged));
+        } catch {
+          // ignore storage write error
+        }
+        return merged;
+      });
+
+      if (tx.status !== 'paid') return;
+
+      if (nextBilling) {
+        applyBillingSummary(nextBilling);
+      } else {
+        const alreadyCredited = (() => {
+          const list = loadStoredJson<string[]>(STORAGE_CREDITED_REFS_KEY);
+          return Array.isArray(list) && list.includes(tx.reference);
+        })();
+
+        setProPlanId(tx.planId);
+        try {
+          window.localStorage.setItem(STORAGE_PRO_PLAN_KEY, tx.planId);
+        } catch {
+          // ignore storage write error
+        }
+
+        if (!alreadyCredited) {
+          setCredits(tx.creditsToAdd);
+          try {
+            const list = loadStoredJson<string[]>(STORAGE_CREDITED_REFS_KEY);
+            const nextList = Array.isArray(list)
+              ? [...list, tx.reference]
+              : [tx.reference];
+            window.localStorage.setItem(
+              STORAGE_CREDITED_REFS_KEY,
+              JSON.stringify(nextList)
+            );
+          } catch {
+            // ignore storage write error
+          }
+        }
+        void syncBillingFromServer();
       }
-      return merged;
-    });
 
-    if (tx.status !== 'paid') return;
-
-    const alreadyCredited = (() => {
-      const list = loadStoredJson<string[]>(STORAGE_CREDITED_REFS_KEY);
-      return Array.isArray(list) && list.includes(tx.reference);
-    })();
-
-    setProPlanId(tx.planId);
-    try {
-      window.localStorage.setItem(STORAGE_PRO_PLAN_KEY, tx.planId);
-    } catch {
-      // ignore storage write error
-    }
-
-    if (!alreadyCredited) {
-      setCredits((prev) => prev + tx.creditsToAdd);
-      try {
-        const list = loadStoredJson<string[]>(STORAGE_CREDITED_REFS_KEY);
-        const nextList = Array.isArray(list) ? [...list, tx.reference] : [tx.reference];
-        window.localStorage.setItem(STORAGE_CREDITED_REFS_KEY, JSON.stringify(nextList));
-      } catch {
-        // ignore storage write error
-      }
-    }
-
-    setShowProUpgrade(false);
-    setInlineNotice(
-      `AI Craft ${tx.planName} activated · +${tx.creditsToAdd.toLocaleString()} credits added`
-    );
-  }, []);
+      setShowProUpgrade(false);
+      setInlineNotice(
+        `AI Craft ${tx.planName} activated · ${tx.creditsToAdd.toLocaleString()} credits / 30 days`
+      );
+    },
+    [applyBillingSummary, syncBillingFromServer]
+  );
 
   const refreshTransactions = useCallback(async () => {
     const email = (authUser?.email || userProfile.email || '').trim();
@@ -1418,18 +1732,26 @@ export default function App() {
       try {
         const res = await fetch('/api/payments/verify', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...getStoredAuthHeaders(),
+          },
           body: JSON.stringify({ reference: paymentRef }),
         });
         const raw = await res.text();
-        let data: { verified?: boolean; transaction?: PaymentTransaction; error?: string } = {};
+        let data: {
+          verified?: boolean;
+          transaction?: PaymentTransaction;
+          billing?: BillingSummary | null;
+          error?: string;
+        } = {};
         try {
           data = raw ? (JSON.parse(raw) as typeof data) : {};
         } catch {
           data = {};
         }
         if (res.ok && data.verified && data.transaction) {
-          applyVerifiedTransaction(data.transaction);
+          applyVerifiedTransaction(data.transaction, data.billing || null);
         } else {
           setInlineNotice(data.error || 'Could not confirm payment status.');
         }
@@ -1442,6 +1764,7 @@ export default function App() {
   const handleRestorePurchase = async () => {
     const email = (authUser?.email || userProfile.email || '').trim();
     try {
+      await syncBillingFromServer();
       const res = await fetch(
         `/api/payments/transactions?email=${encodeURIComponent(email)}`
       );
@@ -1488,8 +1811,10 @@ export default function App() {
       open={showProUpgrade}
       credits={credits}
       activePlanId={proPlanId}
+      billing={billing}
       userEmail={authUser?.email || userProfile.email}
       userId={authUser?.id}
+      authHeaders={getStoredAuthHeaders()}
       dynamicColorEnabled={dynamicColorEnabled}
       onClose={() => setShowProUpgrade(false)}
       onPaymentSuccess={applyVerifiedTransaction}
@@ -1502,6 +1827,7 @@ export default function App() {
       setAuthUser(user);
       setAuthChecking(false);
       setRecoveryTokens(null);
+      cloudHydratedUserRef.current = null;
       try {
         window.localStorage.setItem(STORAGE_SB_SESSION_KEY, JSON.stringify(session));
         if (window.location.search.includes('auth_recovery=')) {
@@ -1533,9 +1859,16 @@ export default function App() {
     }
     try {
       window.localStorage.removeItem(STORAGE_SB_SESSION_KEY);
+      window.localStorage.removeItem(STORAGE_BILLING_KEY);
+      window.localStorage.removeItem(STORAGE_PRO_PLAN_KEY);
+      window.localStorage.removeItem(STORAGE_CREDITS_KEY);
     } catch {
       // ignore storage error
     }
+    cloudHydratedUserRef.current = null;
+    setBilling(null);
+    setProPlanId(null);
+    setCredits(300);
     setShowProUpgrade(false);
     setViewMode('home');
     setActiveTab('create');
@@ -1849,6 +2182,7 @@ export default function App() {
                 profile={userProfile}
                 credits={credits}
                 proPlanId={proPlanId}
+                billing={billing}
                 projectCount={projects.length}
                 mode={mode}
                 dynamicColorEnabled={dynamicColorEnabled}

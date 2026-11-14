@@ -11,8 +11,20 @@ import {
   getPaymentSecretKey,
   initializeCheckoutSession,
   listCustomerTransactions,
+  resolvePlanFromMetadataOrAmount,
   verifyCheckoutTransaction,
+  verifyWebhookSignature,
 } from './api/_paystack.js';
+import {
+  consumeBillingCredit,
+  getAuthenticatedSupabaseUser,
+  loadCloudWorkspace,
+  reconcileAndLoadBillingState,
+  saveCloudWorkspace,
+  saveUserBillingState,
+  serializeBillingSummary,
+  upgradeUserAccountFromTransaction,
+} from './api/_billing.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1301,7 +1313,15 @@ function serializeJobSnapshot(job: CraftJob) {
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '6mb' }));
+  app.use(
+    express.json({
+      limit: '10mb',
+      verify: (req, _res, buf) => {
+        (req as express.Request & { rawBody?: string }).rawBody =
+          buf.toString('utf8');
+      },
+    })
+  );
 
   const craftJobs = new Map<string, CraftJob>();
 
@@ -2058,11 +2078,201 @@ async function startServer() {
       res.status(result.status).json({ error: result.error });
       return;
     }
+
+    let billingSummary = null;
+    if (result.verified) {
+      const cookies = parseCookies(req.headers.cookie);
+      const authHeader = req.headers.authorization || '';
+      const bearerToken = /^bearer\s+/i.test(authHeader)
+        ? authHeader.replace(/^bearer\s+/i, '').trim()
+        : '';
+      const accessToken = bearerToken || cookies[SB_ACCESS_COOKIE] || '';
+      const refreshToken =
+        (typeof req.headers['x-refresh-token'] === 'string'
+          ? req.headers['x-refresh-token'].trim()
+          : '') ||
+        cookies[SB_REFRESH_COOKIE] ||
+        '';
+
+      const auth =
+        accessToken || refreshToken
+          ? await getAuthenticatedSupabaseUser(accessToken, refreshToken)
+          : { user: null, accessToken: '', refreshToken: '' };
+
+      const upgraded = await upgradeUserAccountFromTransaction({
+        tx: result.transaction,
+        authenticatedUser: auth.user,
+        accessToken: auth.accessToken,
+        refreshToken: auth.refreshToken,
+      });
+
+      if (upgraded) {
+        billingSummary = serializeBillingSummary(upgraded);
+      }
+    }
+
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       verified: result.verified,
       transaction: result.transaction,
+      billing: billingSummary,
     });
+  });
+
+  app.get('/api/payments/billing', async (req, res) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const authHeader = req.headers.authorization || '';
+    const bearerToken = /^bearer\s+/i.test(authHeader)
+      ? authHeader.replace(/^bearer\s+/i, '').trim()
+      : '';
+    const accessToken = bearerToken || cookies[SB_ACCESS_COOKIE] || '';
+    const refreshToken =
+      (typeof req.headers['x-refresh-token'] === 'string'
+        ? req.headers['x-refresh-token'].trim()
+        : '') ||
+      cookies[SB_REFRESH_COOKIE] ||
+      '';
+
+    const auth = await getAuthenticatedSupabaseUser(accessToken, refreshToken);
+    if (!auth.user) {
+      res.status(401).json({ error: 'Authentication required.' });
+      return;
+    }
+
+    const state = await reconcileAndLoadBillingState({
+      user: auth.user,
+      accessToken: auth.accessToken,
+      refreshToken: auth.refreshToken,
+      checkPaystack: true,
+    });
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ billing: serializeBillingSummary(state) });
+  });
+
+  app.post('/api/payments/webhook', async (req, res) => {
+    const rawBody =
+      (req as express.Request & { rawBody?: string }).rawBody ??
+      JSON.stringify(req.body ?? {});
+    const signatureHeader = req.headers['x-paystack-signature'];
+    const signature = Array.isArray(signatureHeader)
+      ? signatureHeader[0]
+      : signatureHeader;
+
+    if (!verifyWebhookSignature(rawBody, signature)) {
+      res.status(401).json({ error: 'Invalid webhook signature.' });
+      return;
+    }
+
+    const eventPayload = (req.body ?? {}) as {
+      event?: string;
+      data?: {
+        id?: number | string;
+        reference?: string;
+        amount?: number;
+        status?: string;
+        paid_at?: string;
+        created_at?: string;
+        channel?: string;
+        customer?: { email?: string };
+        metadata?: { userId?: string; [key: string]: unknown };
+      };
+    };
+
+    if (eventPayload.event === 'charge.success' && eventPayload.data?.reference) {
+      const reference = eventPayload.data.reference.trim();
+      const verified = await verifyCheckoutTransaction(reference);
+      if (verified.ok && verified.verified) {
+        await upgradeUserAccountFromTransaction({ tx: verified.transaction });
+      } else if (eventPayload.data.status === 'success') {
+        const amountKobo = Number(eventPayload.data.amount || 0);
+        const plan = resolvePlanFromMetadataOrAmount(
+          eventPayload.data.metadata,
+          amountKobo
+        );
+        if (amountKobo >= plan.amountKobo) {
+          await upgradeUserAccountFromTransaction({
+            tx: {
+              id: String(eventPayload.data.id ?? reference),
+              reference,
+              planId: plan.id,
+              planName: plan.name,
+              amountNgn: Math.round(amountKobo / 100),
+              amountKobo,
+              creditsToAdd: plan.monthlyCredits,
+              status: 'paid',
+              paidAt:
+                eventPayload.data.paid_at ||
+                eventPayload.data.created_at ||
+                new Date().toISOString(),
+              channel: eventPayload.data.channel || 'card',
+              email: eventPayload.data.customer?.email || '',
+              userId:
+                typeof eventPayload.data.metadata?.userId === 'string'
+                  ? eventPayload.data.metadata.userId
+                  : undefined,
+            },
+          });
+        }
+      }
+    }
+
+    res.json({ received: true });
+  });
+
+  app.get('/api/payments/sync', async (req, res) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const authHeader = req.headers.authorization || '';
+    const bearerToken = /^bearer\s+/i.test(authHeader)
+      ? authHeader.replace(/^bearer\s+/i, '').trim()
+      : '';
+    const accessToken = bearerToken || cookies[SB_ACCESS_COOKIE] || '';
+    const refreshToken =
+      (typeof req.headers['x-refresh-token'] === 'string'
+        ? req.headers['x-refresh-token'].trim()
+        : '') ||
+      cookies[SB_REFRESH_COOKIE] ||
+      '';
+
+    const auth = await getAuthenticatedSupabaseUser(accessToken, refreshToken);
+    if (!auth.user) {
+      res.status(401).json({ synced: false, workspace: null });
+      return;
+    }
+
+    const workspace = await loadCloudWorkspace(auth.user.id);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ synced: Boolean(workspace), workspace });
+  });
+
+  app.post('/api/payments/sync', async (req, res) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const authHeader = req.headers.authorization || '';
+    const bearerToken = /^bearer\s+/i.test(authHeader)
+      ? authHeader.replace(/^bearer\s+/i, '').trim()
+      : '';
+    const accessToken = bearerToken || cookies[SB_ACCESS_COOKIE] || '';
+    const refreshToken =
+      (typeof req.headers['x-refresh-token'] === 'string'
+        ? req.headers['x-refresh-token'].trim()
+        : '') ||
+      cookies[SB_REFRESH_COOKIE] ||
+      '';
+
+    const auth = await getAuthenticatedSupabaseUser(accessToken, refreshToken);
+    if (!auth.user) {
+      res.status(401).json({ synced: false });
+      return;
+    }
+
+    if (!req.body || typeof req.body !== 'object') {
+      res.status(400).json({ synced: false, error: 'Invalid payload.' });
+      return;
+    }
+
+    const saved = await saveCloudWorkspace(auth.user.id, req.body);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ synced: saved });
   });
 
   app.get('/api/craft/jobs/:jobId', (req, res) => {
@@ -2292,6 +2502,48 @@ async function startServer() {
     if (!message) {
       res.status(400).json({ error: 'Prompt message is required.' });
       return;
+    }
+
+    {
+      const cookies = parseCookies(req.headers.cookie);
+      const authHeader = req.headers.authorization || '';
+      const bearerToken = /^bearer\s+/i.test(authHeader)
+        ? authHeader.replace(/^bearer\s+/i, '').trim()
+        : '';
+      const accessToken = bearerToken || cookies[SB_ACCESS_COOKIE] || '';
+      const refreshToken =
+        (typeof req.headers['x-refresh-token'] === 'string'
+          ? req.headers['x-refresh-token'].trim()
+          : '') ||
+        cookies[SB_REFRESH_COOKIE] ||
+        '';
+
+      if (accessToken || refreshToken) {
+        const auth = await getAuthenticatedSupabaseUser(accessToken, refreshToken);
+        if (auth.user) {
+          const currentBilling = await reconcileAndLoadBillingState({
+            user: auth.user,
+            accessToken: auth.accessToken,
+            refreshToken: auth.refreshToken,
+            checkPaystack: false,
+          });
+          const consumed = consumeBillingCredit(currentBilling, 1, Date.now());
+          if (!consumed.allowed) {
+            res.status(402).json({
+              error: consumed.error,
+              code: consumed.code,
+              billing: serializeBillingSummary(consumed.state),
+            });
+            return;
+          }
+          await saveUserBillingState({
+            user: auth.user,
+            state: consumed.state,
+            accessToken: auth.accessToken,
+            refreshToken: auth.refreshToken,
+          });
+        }
+      }
     }
 
     pruneOldJobs();

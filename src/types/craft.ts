@@ -22,6 +22,21 @@ export interface AuthUser {
   provider: string;
 }
 
+export type SubscriptionTier = 'free' | 'starter' | 'plus' | 'studio' | 'annual';
+
+export interface BillingSummary {
+  tier: SubscriptionTier;
+  planName: string;
+  dailyCreditsUsed: number;
+  dailyLimit: number | null;
+  dailyResetAt: string;
+  monthlyCreditsRemaining: number;
+  monthlyLimit: number;
+  monthlyResetAt: string;
+  annualCyclesRemaining: number;
+  subscriptionExpiresAt: string | null;
+}
+
 export interface PaymentTransaction {
   id: string;
   reference: string;

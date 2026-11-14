@@ -22,7 +22,7 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
-import { PaymentTransaction } from '../types/craft';
+import { BillingSummary, PaymentTransaction } from '../types/craft';
 
 export interface ProPlanOption {
   id: 'starter' | 'plus' | 'studio' | 'annual';
@@ -30,6 +30,7 @@ export interface ProPlanOption {
   subtitle: string;
   priceText: string;
   cadenceText: string;
+  dailyLimit: number;
   creditsToAdd: number;
   badgeText?: string;
 }
@@ -38,34 +39,38 @@ export const PRO_PLANS: ProPlanOption[] = [
   {
     id: 'starter',
     name: 'Starter',
-    subtitle: 'Pay ₦25,000.00 monthly',
+    subtitle: 'Max 1,500/day · 45,000 credits / 30d',
     priceText: '₦25,000.00',
     cadenceText: 'per month',
-    creditsToAdd: 100,
+    dailyLimit: 1500,
+    creditsToAdd: 45000,
   },
   {
     id: 'plus',
     name: 'Plus',
-    subtitle: 'Pay ₦48,000.00 monthly',
+    subtitle: 'Max 3,500/day · 105,000 credits / 30d',
     priceText: '₦48,000.00',
     cadenceText: 'per month',
-    creditsToAdd: 250,
+    dailyLimit: 3500,
+    creditsToAdd: 105000,
   },
   {
     id: 'studio',
     name: 'Studio',
-    subtitle: 'Pay ₦70,000.00 monthly',
+    subtitle: 'Max 6,000/day · 180,000 credits / 30d',
     priceText: '₦70,000.00',
     cadenceText: 'per month',
-    creditsToAdd: 500,
+    dailyLimit: 6000,
+    creditsToAdd: 180000,
   },
   {
     id: 'annual',
     name: 'Annual',
-    subtitle: 'Pay ₦800,000.00 yearly',
+    subtitle: 'Max 8,000/day · 240,000/mo · 12 cycles',
     priceText: '₦800,000.00',
     cadenceText: 'per year',
-    creditsToAdd: 6000,
+    dailyLimit: 8000,
+    creditsToAdd: 240000,
     badgeText: 'PRO YEARLY',
   },
 ];
@@ -114,11 +119,16 @@ interface ProUpgradeModalProps {
   open: boolean;
   credits: number;
   activePlanId: string | null;
+  billing: BillingSummary | null;
   userEmail: string;
   userId?: string;
+  authHeaders?: Record<string, string>;
   dynamicColorEnabled: boolean;
   onClose: () => void;
-  onPaymentSuccess: (transaction: PaymentTransaction) => void;
+  onPaymentSuccess: (
+    transaction: PaymentTransaction,
+    billing?: BillingSummary | null
+  ) => void;
   onRestorePurchase: () => Promise<{ restored: boolean; message: string }> | { restored: boolean; message: string };
 }
 
@@ -126,8 +136,10 @@ export function ProUpgradeModal({
   open,
   credits,
   activePlanId,
+  billing,
   userEmail,
   userId,
+  authHeaders,
   dynamicColorEnabled,
   onClose,
   onPaymentSuccess,
@@ -195,6 +207,7 @@ export function ProUpgradeModal({
         | {
             type?: string;
             transaction?: PaymentTransaction;
+            billing?: BillingSummary | null;
             message?: string;
           }
         | undefined;
@@ -209,7 +222,7 @@ export function ProUpgradeModal({
         } catch {
           // ignore storage cleanup
         }
-        onPaymentSuccess(data.transaction);
+        onPaymentSuccess(data.transaction, data.billing || null);
       } else if (data.type === 'PAYMENT_AUTH_ERROR') {
         stopPopupPolling();
         setProcessingPayment(false);
@@ -326,21 +339,25 @@ export function ProUpgradeModal({
 
           if (popup && popup.closed) {
             stopPopupPolling();
-            if (data.reference) {
+              if (data.reference) {
               void (async () => {
                 try {
                   const verifyRes = await fetch('/api/payments/verify', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                      'Content-Type': 'application/json',
+                      ...(authHeaders || {}),
+                    },
                     body: JSON.stringify({ reference: data.reference }),
                   });
                   const verifyData = await safeParseJson<{
                     verified?: boolean;
                     transaction?: PaymentTransaction;
+                    billing?: BillingSummary | null;
                   }>(verifyRes);
                   setProcessingPayment(false);
                   if (verifyRes.ok && verifyData?.verified && verifyData.transaction) {
-                    onPaymentSuccess(verifyData.transaction);
+                    onPaymentSuccess(verifyData.transaction, verifyData.billing || null);
                   }
                 } catch {
                   setProcessingPayment(false);
@@ -486,7 +503,9 @@ export function ProUpgradeModal({
                 </div>
 
                 <span className="text-[11px] font-medium text-[#71717A] tabular-nums">
-                  {credits} credits
+                  {billing?.dailyLimit
+                    ? `${credits.toLocaleString()} left · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today`
+                    : `${credits.toLocaleString()} credits · Free 300/30d`}
                 </span>
               </div>
 

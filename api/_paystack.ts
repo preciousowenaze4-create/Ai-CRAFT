@@ -1,16 +1,23 @@
+import crypto from 'node:crypto';
+
+export type SubscriptionTier = 'free' | 'starter' | 'plus' | 'studio' | 'annual';
+export type PaidTierId = 'starter' | 'plus' | 'studio' | 'annual';
+
 export interface BillingPlanConfig {
-  id: 'starter' | 'plus' | 'studio' | 'annual';
+  id: SubscriptionTier;
   name: string;
   amountKobo: number;
   amountNgn: number;
-  creditsToAdd: number;
+  dailyLimit: number | null;
+  monthlyCredits: number;
+  annualCycles: number; // total 30-day cycles covered (1 for monthly, 12 for annual)
   cadenceText: string;
 }
 
 export interface PaymentTransactionRecord {
   id: string;
   reference: string;
-  planId: 'starter' | 'plus' | 'studio' | 'annual';
+  planId: PaidTierId;
   planName: string;
   amountNgn: number;
   amountKobo: number;
@@ -19,15 +26,29 @@ export interface PaymentTransactionRecord {
   paidAt: string;
   channel: string;
   email: string;
+  userId?: string;
 }
 
-export const BILLING_PLANS: Record<BillingPlanConfig['id'], BillingPlanConfig> = {
+export const FREE_TIER_CONFIG: BillingPlanConfig = {
+  id: 'free',
+  name: 'Free',
+  amountKobo: 0,
+  amountNgn: 0,
+  dailyLimit: null,
+  monthlyCredits: 300,
+  annualCycles: 1,
+  cadenceText: 'every 30 days',
+};
+
+export const BILLING_PLANS: Record<PaidTierId, BillingPlanConfig> = {
   starter: {
     id: 'starter',
     name: 'Starter',
     amountKobo: 2500000,
     amountNgn: 25000,
-    creditsToAdd: 100,
+    dailyLimit: 1500,
+    monthlyCredits: 45000,
+    annualCycles: 1,
     cadenceText: 'per month',
   },
   plus: {
@@ -35,7 +56,9 @@ export const BILLING_PLANS: Record<BillingPlanConfig['id'], BillingPlanConfig> =
     name: 'Plus',
     amountKobo: 4800000,
     amountNgn: 48000,
-    creditsToAdd: 250,
+    dailyLimit: 3500,
+    monthlyCredits: 105000,
+    annualCycles: 1,
     cadenceText: 'per month',
   },
   studio: {
@@ -43,7 +66,9 @@ export const BILLING_PLANS: Record<BillingPlanConfig['id'], BillingPlanConfig> =
     name: 'Studio',
     amountKobo: 7000000,
     amountNgn: 70000,
-    creditsToAdd: 500,
+    dailyLimit: 6000,
+    monthlyCredits: 180000,
+    annualCycles: 1,
     cadenceText: 'per month',
   },
   annual: {
@@ -51,10 +76,25 @@ export const BILLING_PLANS: Record<BillingPlanConfig['id'], BillingPlanConfig> =
     name: 'Annual',
     amountKobo: 80000000,
     amountNgn: 800000,
-    creditsToAdd: 6000,
+    dailyLimit: 8000,
+    monthlyCredits: 240000,
+    annualCycles: 12,
     cadenceText: 'per year',
   },
 };
+
+export function getPlanConfig(tier: string | null | undefined): BillingPlanConfig {
+  const clean = (tier || '').trim().toLowerCase();
+  if (
+    clean === 'starter' ||
+    clean === 'plus' ||
+    clean === 'studio' ||
+    clean === 'annual'
+  ) {
+    return BILLING_PLANS[clean];
+  }
+  return FREE_TIER_CONFIG;
+}
 
 const PAYSTACK_API_BASE = 'https://api.paystack.co';
 
@@ -94,10 +134,28 @@ export function getPaymentSecretKey(): string {
   return '';
 }
 
+export function verifyWebhookSignature(
+  rawBody: string,
+  signatureHeader: string | null | undefined
+): boolean {
+  const secretKey = getPaymentSecretKey();
+  if (!secretKey || !signatureHeader) return false;
+
+  const expected = crypto
+    .createHmac('sha512', secretKey)
+    .update(rawBody)
+    .digest('hex');
+
+  const sigBuf = Buffer.from(signatureHeader.trim().toLowerCase(), 'utf8');
+  const expBuf = Buffer.from(expected.toLowerCase(), 'utf8');
+  if (sigBuf.length !== expBuf.length) return false;
+  return crypto.timingSafeEqual(sigBuf, expBuf);
+}
+
 export function resolvePlanFromMetadataOrAmount(
   metadata: unknown,
   amountKobo: number
-): BillingPlanConfig {
+): BillingPlanConfig & { id: PaidTierId } {
   const meta =
     metadata && typeof metadata === 'object'
       ? (metadata as Record<string, unknown>)
@@ -110,13 +168,13 @@ export function resolvePlanFromMetadataOrAmount(
     rawPlanId === 'studio' ||
     rawPlanId === 'annual'
   ) {
-    return BILLING_PLANS[rawPlanId];
+    return BILLING_PLANS[rawPlanId] as BillingPlanConfig & { id: PaidTierId };
   }
 
-  const byAmount = Object.values(BILLING_PLANS).find(
+  const byAmount = (Object.values(BILLING_PLANS) as Array<BillingPlanConfig & { id: PaidTierId }>).find(
     (p) => p.amountKobo === amountKobo
   );
-  return byAmount ?? BILLING_PLANS.starter;
+  return byAmount ?? (BILLING_PLANS.starter as BillingPlanConfig & { id: PaidTierId });
 }
 
 export async function initializeCheckoutSession(params: {
@@ -124,12 +182,15 @@ export async function initializeCheckoutSession(params: {
   email: string;
   userId?: string;
   callbackUrl: string;
-}): Promise<{
-  ok: true;
-  authorizationUrl: string;
-  reference: string;
-  plan: BillingPlanConfig;
-} | { ok: false; status: number; error: string }> {
+}): Promise<
+  | {
+      ok: true;
+      authorizationUrl: string;
+      reference: string;
+      plan: BillingPlanConfig;
+    }
+  | { ok: false; status: number; error: string }
+> {
   const secretKey = getPaymentSecretKey();
   if (!secretKey) {
     return {
@@ -175,7 +236,8 @@ export async function initializeCheckoutSession(params: {
         metadata: {
           planId: plan.id,
           planName: plan.name,
-          creditsToAdd: plan.creditsToAdd,
+          creditsToAdd: plan.monthlyCredits,
+          dailyLimit: plan.dailyLimit,
           userId: params.userId || '',
         },
       }),
@@ -261,7 +323,7 @@ export async function verifyCheckoutTransaction(reference: string): Promise<
         created_at?: string;
         channel?: string;
         customer?: { email?: string };
-        metadata?: unknown;
+        metadata?: { userId?: string; [key: string]: unknown };
       };
     };
 
@@ -277,6 +339,10 @@ export async function verifyCheckoutTransaction(reference: string): Promise<
     const amountKobo = Number(tx.amount || 0);
     const plan = resolvePlanFromMetadataOrAmount(tx.metadata, amountKobo);
     const isPaid = tx.status === 'success' && amountKobo >= plan.amountKobo;
+    const metaUserId =
+      tx.metadata && typeof tx.metadata === 'object' && typeof tx.metadata.userId === 'string'
+        ? tx.metadata.userId
+        : undefined;
 
     return {
       ok: true,
@@ -288,7 +354,7 @@ export async function verifyCheckoutTransaction(reference: string): Promise<
         planName: plan.name,
         amountNgn: Math.round(amountKobo / 100),
         amountKobo,
-        creditsToAdd: plan.creditsToAdd,
+        creditsToAdd: plan.monthlyCredits,
         status:
           tx.status === 'success'
             ? 'paid'
@@ -298,6 +364,7 @@ export async function verifyCheckoutTransaction(reference: string): Promise<
         paidAt: tx.paid_at || tx.created_at || new Date().toISOString(),
         channel: tx.channel || 'card',
         email: tx.customer?.email || '',
+        userId: metaUserId,
       },
     };
   } catch (err) {
@@ -341,7 +408,7 @@ export async function listCustomerTransactions(email: string): Promise<{
         created_at?: string;
         channel?: string;
         customer?: { email?: string };
-        metadata?: unknown;
+        metadata?: { userId?: string; [key: string]: unknown };
       }>;
     };
 
@@ -356,6 +423,11 @@ export async function listCustomerTransactions(email: string): Promise<{
     const transactions: PaymentTransactionRecord[] = filtered.map((tx) => {
       const amountKobo = Number(tx.amount || 0);
       const plan = resolvePlanFromMetadataOrAmount(tx.metadata, amountKobo);
+      const metaUserId =
+        tx.metadata && typeof tx.metadata === 'object' && typeof tx.metadata.userId === 'string'
+          ? tx.metadata.userId
+          : undefined;
+
       return {
         id: String(tx.id ?? tx.reference ?? ''),
         reference: tx.reference || '',
@@ -363,7 +435,7 @@ export async function listCustomerTransactions(email: string): Promise<{
         planName: plan.name,
         amountNgn: Math.round(amountKobo / 100),
         amountKobo,
-        creditsToAdd: plan.creditsToAdd,
+        creditsToAdd: plan.monthlyCredits,
         status:
           tx.status === 'success'
             ? 'paid'
@@ -373,6 +445,7 @@ export async function listCustomerTransactions(email: string): Promise<{
         paidAt: tx.paid_at || tx.created_at || new Date().toISOString(),
         channel: tx.channel || 'card',
         email: tx.customer?.email || '',
+        userId: metaUserId,
       };
     });
 
@@ -455,7 +528,11 @@ export function buildPaymentCallbackHtml(): string {
 
           if (window.opener) {
             window.opener.postMessage(
-              { type: 'PAYMENT_AUTH_SUCCESS', transaction: payload.transaction },
+              {
+                type: 'PAYMENT_AUTH_SUCCESS',
+                transaction: payload.transaction,
+                billing: payload.billing || null
+              },
               '*'
             );
             window.close();

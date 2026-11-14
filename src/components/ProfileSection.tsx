@@ -15,6 +15,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import {
+  BillingSummary,
   BuildMode,
   MODE_THEMES,
   PaymentTransaction,
@@ -27,6 +28,7 @@ interface ProfileSectionProps {
   profile: UserProfile;
   credits: number;
   proPlanId: string | null;
+  billing: BillingSummary | null;
   projectCount: number;
   mode: BuildMode;
   dynamicColorEnabled: boolean;
@@ -103,10 +105,22 @@ function formatTransactionDate(iso: string): string {
   }
 }
 
+function formatResetDate(iso: string | undefined | null): string {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  } catch {
+    return '';
+  }
+}
+
 export function ProfileSection({
   profile,
   credits,
   proPlanId,
+  billing,
   projectCount,
   mode,
   dynamicColorEnabled,
@@ -137,6 +151,7 @@ export function ProfileSection({
   const activePlanName = proPlanId
     ? PRO_PLANS.find((p) => p.id === proPlanId)?.name ?? 'Pro'
     : 'Free';
+  const cycleResetLabel = formatResetDate(billing?.monthlyResetAt);
 
   const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -195,7 +210,7 @@ export function ProfileSection({
           </div>
 
           <span className="text-[11px] font-medium text-[#71717A] tabular-nums">
-            {projectCount} {projectCount === 1 ? 'app' : 'apps'} · {credits} credits
+            {projectCount} {projectCount === 1 ? 'app' : 'apps'} · {credits.toLocaleString()} credits
           </span>
         </div>
 
@@ -499,8 +514,10 @@ export function ProfileSection({
                   </p>
                   <p className="text-[10px] text-[#71717A] tabular-nums truncate">
                     {proPlanId
-                      ? `${activePlanName} plan · ${credits} credits`
-                      : `${credits} credits remaining`}
+                      ? billing?.dailyLimit
+                        ? `${activePlanName} · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today · ${credits.toLocaleString()} left`
+                        : `${activePlanName} plan · ${credits.toLocaleString()} credits`
+                      : `Free (300/30d) · ${credits.toLocaleString()} left${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
                   </p>
                 </div>
               </div>
@@ -575,10 +592,12 @@ export function ProfileSection({
               </span>
               <div className="min-w-0">
                 <p className="font-display font-bold text-[13px] text-[#0B0B0F] leading-tight">
-                  {proPlanId ? `AI Craft ${activePlanName}` : 'Free Plan'}
+                  {proPlanId ? `AI Craft ${activePlanName}` : 'Free Plan (300 / 30 days)'}
                 </p>
-                <p className="text-[11px] text-[#71717A] tabular-nums mt-0.5">
-                  {credits.toLocaleString()} credits available
+                <p className="text-[10.5px] text-[#71717A] tabular-nums mt-0.5 truncate">
+                  {billing?.dailyLimit
+                    ? `${credits.toLocaleString()}/${billing.monthlyLimit.toLocaleString()} cycle · ${billing.dailyCreditsUsed.toLocaleString()}/${billing.dailyLimit.toLocaleString()} today`
+                    : `${credits.toLocaleString()} credits available${cycleResetLabel ? ` · resets ${cycleResetLabel}` : ''}`}
                 </p>
               </div>
             </div>

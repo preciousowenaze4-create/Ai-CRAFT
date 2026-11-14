@@ -1,4 +1,5 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import { enforceAndConsumeGenerationCredit } from '../_billing.js';
 
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
@@ -1047,6 +1048,18 @@ export async function POST(request: Request): Promise<Response> {
 
   if (!message) {
     return Response.json({ error: 'Prompt message is required.' }, { status: 400 });
+  }
+
+  const creditCheck = await enforceAndConsumeGenerationCredit(request, 1);
+  if (!creditCheck.allowed) {
+    return Response.json(
+      {
+        error: creditCheck.error,
+        code: creditCheck.code,
+        billing: creditCheck.billing,
+      },
+      { status: creditCheck.status }
+    );
   }
 
   const encoder = new TextEncoder();
