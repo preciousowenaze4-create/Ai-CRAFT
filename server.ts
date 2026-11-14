@@ -16,6 +16,9 @@ import {
   verifyWebhookSignature,
 } from './api/_paystack.js';
 import {
+  VerifiedGenerationContext,
+  calculateBuildCreditsForBytes,
+  commitGenerationCredits,
   consumeBillingCredit,
   getAuthenticatedSupabaseUser,
   loadCloudWorkspace,
@@ -2504,6 +2507,8 @@ async function startServer() {
       return;
     }
 
+    let generationCreditContext: VerifiedGenerationContext | null = null;
+    let initialBillingSummary = null;
     {
       const cookies = parseCookies(req.headers.cookie);
       const authHeader = req.headers.authorization || '';
@@ -2527,21 +2532,22 @@ async function startServer() {
             refreshToken: auth.refreshToken,
             checkPaystack: false,
           });
-          const consumed = consumeBillingCredit(currentBilling, 1, Date.now());
-          if (!consumed.allowed) {
+          const check = consumeBillingCredit(currentBilling, 1, Date.now());
+          if (!check.allowed) {
             res.status(402).json({
-              error: consumed.error,
-              code: consumed.code,
-              billing: serializeBillingSummary(consumed.state),
+              error: check.error,
+              code: check.code,
+              billing: serializeBillingSummary(check.state),
             });
             return;
           }
-          await saveUserBillingState({
+          generationCreditContext = {
             user: auth.user,
-            state: consumed.state,
             accessToken: auth.accessToken,
             refreshToken: auth.refreshToken,
-          });
+            state: currentBilling,
+          };
+          initialBillingSummary = serializeBillingSummary(currentBilling);
         }
       }
     }
@@ -2789,6 +2795,8 @@ async function startServer() {
       let emittedFiles: string[] = [];
       let emittedPlanSteps: string[] = [];
       let lastProgressSentAt = 0;
+      let buildCreditsEmitted = 0;
+      let lastCreditEmitAt = 0;
       let modelUsed = '';
       let noticedReasoning = false;
 
@@ -2797,7 +2805,8 @@ async function startServer() {
           emittedProseLength > 0 ||
           emittedFiles.length > 0 ||
           emittedPlanSteps.length > 0 ||
-          emittedBuildPhase
+          emittedBuildPhase ||
+          buildCreditsEmitted > 0
         ) {
           sendEvent({ type: 'reset' });
         }
@@ -2812,6 +2821,8 @@ async function startServer() {
         emittedFiles = [];
         emittedPlanSteps = [];
         lastProgressSentAt = 0;
+        buildCreditsEmitted = 0;
+        lastCreditEmitAt = 0;
         noticedReasoning = false;
       };
 
@@ -2875,6 +2886,20 @@ async function startServer() {
           sendEvent({
             type: 'progress',
             bytesBuilt: cleanHtml.length,
+          });
+        }
+
+        const targetCredits = calculateBuildCreditsForBytes(cleanHtml.length);
+        if (
+          targetCredits > buildCreditsEmitted &&
+          (buildCreditsEmitted === 0 || nowMs - lastCreditEmitAt >= 900)
+        ) {
+          buildCreditsEmitted += 1;
+          lastCreditEmitAt = nowMs;
+          sendEvent({
+            type: 'credits',
+            used: buildCreditsEmitted,
+            targetUsed: targetCredits,
           });
         }
       };
@@ -3324,6 +3349,20 @@ async function startServer() {
         }
       }
 
+      const finalCreditsUsed =
+        resolvedKind === 'build' && (previewHtml.length > 0 || finalFiles.length > 0)
+          ? Math.max(1, calculateBuildCreditsForBytes(previewHtml.length))
+          : 0;
+
+      let updatedBilling = initialBillingSummary;
+      if (finalCreditsUsed > 0 && generationCreditContext) {
+        updatedBilling =
+          (await commitGenerationCredits(
+            generationCreditContext,
+            finalCreditsUsed
+          ).catch(() => null)) ?? initialBillingSummary;
+      }
+
       const finalInfo = resolveModelInfo(modelUsed);
       sendEvent({
         type: 'done',
@@ -3333,6 +3372,8 @@ async function startServer() {
         allFiles: finalFiles,
         suggestions: finalSuggestions,
         bytesBuilt: previewHtml.length,
+        creditsUsed: finalCreditsUsed,
+        billing: updatedBilling,
         modelUsed: finalInfo.id,
         modelName: finalInfo.name,
         provider: finalInfo.provider,

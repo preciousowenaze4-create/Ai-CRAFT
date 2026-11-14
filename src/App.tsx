@@ -238,6 +238,17 @@ function mergeProjectsFromCloud(
   return Array.from(mergedMap.values());
 }
 
+const CLIENT_BYTES_PER_BUILD_CREDIT = 1350;
+const CLIENT_MAX_CREDITS_PER_BUILD = 20;
+
+function calculateClientBuildCredits(bytesBuilt: number): number {
+  if (!Number.isFinite(bytesBuilt) || bytesBuilt <= 0) return 0;
+  return Math.min(
+    CLIENT_MAX_CREDITS_PER_BUILD,
+    Math.max(1, Math.floor(bytesBuilt / CLIENT_BYTES_PER_BUILD_CREDIT) + 1)
+  );
+}
+
 export default function App() {
   const [recoveryTokens, setRecoveryTokens] = useState<StoredSupabaseSession | null>(() => {
     const params = new URLSearchParams(window.location.search);
@@ -655,7 +666,7 @@ export default function App() {
 
   useEffect(() => {
     if (!inlineNotice) return;
-    const timer = window.setTimeout(() => setInlineNotice(null), 2800);
+    const timer = window.setTimeout(() => setInlineNotice(null), 4000);
     return () => window.clearTimeout(timer);
   }, [inlineNotice]);
 
@@ -751,6 +762,27 @@ export default function App() {
     []
   );
 
+  const adjustLocalCredits = useCallback((delta: number) => {
+    if (delta === 0) return;
+    setCredits((prev) => Math.max(0, prev + delta));
+    setBilling((prev) => {
+      if (!prev) return prev;
+      const nextMonthly = Math.max(0, prev.monthlyCreditsRemaining + delta);
+      const nextDaily = Math.max(0, prev.dailyCreditsUsed - delta);
+      const updated: BillingSummary = {
+        ...prev,
+        dailyCreditsUsed: nextDaily,
+        monthlyCreditsRemaining: nextMonthly,
+      };
+      try {
+        window.localStorage.setItem(STORAGE_BILLING_KEY, JSON.stringify(updated));
+      } catch {
+        // ignore storage error
+      }
+      return updated;
+    });
+  }, []);
+
   const consumeSseStream = useCallback(
     async (
       projectId: string,
@@ -774,6 +806,37 @@ export default function App() {
       let pendingDelta = '';
       let pendingBytes: number | null = null;
       let flushTimer: number | null = null;
+
+      // Smooth, realistic token metering: 0 credits for chat/thinking, ~1 credit / ~950ms during active builds
+      let turnChargedSoFar = 0;
+      let targetCreditsForTurn = 0;
+      let currentTurnPhase: 'understanding' | 'building' | 'complete' | 'error' = 'understanding';
+      let currentTurnKind: TurnKind = 'chat';
+      let latestBytesBuilt = 0;
+      let creditTickTimer: number | null = null;
+
+      const stopCreditTicker = () => {
+        if (creditTickTimer !== null) {
+          window.clearTimeout(creditTickTimer);
+          creditTickTimer = null;
+        }
+      };
+
+      const scheduleCreditTicker = () => {
+        if (creditTickTimer !== null) return;
+        if (turnChargedSoFar >= targetCreditsForTurn) return;
+        const delayMs = turnChargedSoFar === 0 ? 320 : 950;
+        creditTickTimer = window.setTimeout(() => {
+          creditTickTimer = null;
+          if (turnChargedSoFar < targetCreditsForTurn) {
+            turnChargedSoFar += 1;
+            adjustLocalCredits(-1);
+          }
+          if (turnChargedSoFar < targetCreditsForTurn) {
+            scheduleCreditTicker();
+          }
+        }, delayMs);
+      };
 
       const flushBuffered = () => {
         if (flushTimer !== null) {
@@ -837,6 +900,10 @@ export default function App() {
                 planSteps?: string[];
                 suggestions?: string[];
                 bytesBuilt?: number;
+                used?: number;
+                targetUsed?: number;
+                creditsUsed?: number;
+                billing?: BillingSummary | null;
                 text?: string;
                 aiText?: string;
                 fullText?: string;
@@ -862,6 +929,9 @@ export default function App() {
                 if (typeof evt.startedAt === 'number') {
                   startedAt = evt.startedAt;
                 }
+                if (evt.kind) currentTurnKind = evt.kind;
+                if (evt.phase) currentTurnPhase = evt.phase;
+                if (typeof evt.bytesBuilt === 'number') latestBytesBuilt = evt.bytesBuilt;
                 updateTurn(projectId, turnId, (t) => ({
                   ...t,
                   jobId: evt.jobId ?? t.jobId,
@@ -890,6 +960,7 @@ export default function App() {
                   errorMessage: evt.errorMessage ?? t.errorMessage,
                 }));
               } else if (evt.type === 'meta') {
+                if (evt.kind) currentTurnKind = evt.kind;
                 updateTurn(projectId, turnId, (t) => ({
                   ...t,
                   kind: evt.kind ?? t.kind,
@@ -904,6 +975,8 @@ export default function App() {
               ) {
                 flushBuffered();
                 const nextPhase = evt.phase;
+                currentTurnPhase = nextPhase;
+                currentTurnKind = evt.kind ?? (nextPhase === 'building' ? 'build' : currentTurnKind);
                 updateTurn(projectId, turnId, (t) => ({
                   ...t,
                   kind:
@@ -918,8 +991,31 @@ export default function App() {
                   ...t,
                   planSteps: evt.allSteps,
                 }));
+              } else if (evt.type === 'credits') {
+                const desiredTarget =
+                  typeof evt.targetUsed === 'number'
+                    ? evt.targetUsed
+                    : typeof evt.used === 'number'
+                      ? evt.used
+                      : 0;
+                if (desiredTarget > targetCreditsForTurn) {
+                  targetCreditsForTurn = Math.min(CLIENT_MAX_CREDITS_PER_BUILD, desiredTarget);
+                  scheduleCreditTicker();
+                }
               } else if (evt.type === 'file' && evt.path) {
                 flushBuffered();
+                currentTurnKind = 'build';
+                if (currentTurnPhase === 'understanding') {
+                  currentTurnPhase = 'building';
+                }
+                if (typeof evt.bytesBuilt === 'number') {
+                  latestBytesBuilt = evt.bytesBuilt;
+                  const estCredits = calculateClientBuildCredits(evt.bytesBuilt);
+                  if (estCredits > targetCreditsForTurn) {
+                    targetCreditsForTurn = estCredits;
+                    scheduleCreditTicker();
+                  }
+                }
                 updateTurn(projectId, turnId, (t) => ({
                   ...t,
                   kind: 'build',
@@ -934,10 +1030,27 @@ export default function App() {
                 }));
               } else if (evt.type === 'progress') {
                 if (typeof evt.bytesBuilt === 'number') {
+                  latestBytesBuilt = evt.bytesBuilt;
                   pendingBytes = evt.bytesBuilt;
                   scheduleBufferedFlush();
+                  if (currentTurnPhase === 'building' || currentTurnKind === 'build') {
+                    const estCredits = calculateClientBuildCredits(evt.bytesBuilt);
+                    if (estCredits > targetCreditsForTurn) {
+                      targetCreditsForTurn = estCredits;
+                      scheduleCreditTicker();
+                    }
+                  }
                 }
               } else if (evt.type === 'reset') {
+                stopCreditTicker();
+                if (turnChargedSoFar > 0) {
+                  adjustLocalCredits(turnChargedSoFar);
+                  turnChargedSoFar = 0;
+                }
+                targetCreditsForTurn = 0;
+                currentTurnKind = 'chat';
+                currentTurnPhase = 'understanding';
+                latestBytesBuilt = 0;
                 pendingDelta = '';
                 pendingBytes = null;
                 if (flushTimer !== null) {
@@ -962,7 +1075,9 @@ export default function App() {
                 scheduleBufferedFlush();
               } else if (evt.type === 'done') {
                 sawTerminalEvent = true;
+                stopCreditTicker();
                 flushBuffered();
+                const finalKind = evt.kind ?? currentTurnKind;
                 const finalSeconds = Math.max(
                   1,
                   Math.round(
@@ -1002,7 +1117,34 @@ export default function App() {
                     modelProvider: evt.provider ?? t.modelProvider,
                   };
                 });
-                void syncBillingFromServer();
+                if (evt.billing) {
+                  applyBillingSummary(evt.billing);
+                } else {
+                  const hasBuiltCode =
+                    Boolean(evt.previewHtml) ||
+                    (Array.isArray(evt.allFiles) && evt.allFiles.length > 0);
+                  const expectedFinalCost =
+                    finalKind === 'chat' || !hasBuiltCode
+                      ? 0
+                      : Math.min(
+                          CLIENT_MAX_CREDITS_PER_BUILD,
+                          Math.max(
+                            1,
+                            typeof evt.creditsUsed === 'number'
+                              ? evt.creditsUsed
+                              : calculateClientBuildCredits(
+                                  typeof evt.bytesBuilt === 'number'
+                                    ? evt.bytesBuilt
+                                    : latestBytesBuilt
+                                )
+                          )
+                        );
+                  const diff = expectedFinalCost - turnChargedSoFar;
+                  if (diff !== 0) {
+                    adjustLocalCredits(-diff);
+                  }
+                  void syncBillingFromServer();
+                }
                 if (
                   notificationsEnabled &&
                   document.visibilityState === 'hidden' &&
@@ -1025,7 +1167,13 @@ export default function App() {
                 }
               } else if (evt.type === 'error') {
                 sawTerminalEvent = true;
+                stopCreditTicker();
                 flushBuffered();
+                if (turnChargedSoFar > 0) {
+                  adjustLocalCredits(turnChargedSoFar);
+                  turnChargedSoFar = 0;
+                  void syncBillingFromServer();
+                }
                 updateTurn(projectId, turnId, (t) => ({
                   ...t,
                   phase: 'error',
@@ -1039,12 +1187,19 @@ export default function App() {
           }
         }
       } finally {
+        stopCreditTicker();
         flushBuffered();
       }
 
       return { sawTerminalEvent, latestJobId };
     },
-    [notificationsEnabled, syncBillingFromServer, updateTurn]
+    [
+      adjustLocalCredits,
+      applyBillingSummary,
+      notificationsEnabled,
+      syncBillingFromServer,
+      updateTurn,
+    ]
   );
 
   const runBuilderStream = useCallback(
@@ -1413,12 +1568,15 @@ export default function App() {
     setMode(nextMode);
   };
 
-  const checkCanConsumeCredit = (): boolean => {
-    if (credits <= 0) {
+  const checkCanConsumeCredit = useCallback((): boolean => {
+    if (
+      credits <= 0 ||
+      (billing !== null && billing.monthlyCreditsRemaining <= 0)
+    ) {
       setInlineNotice(
         proPlanId
-          ? 'Monthly credit limit reached. Wait for your 30-day cycle reset or upgrade your plan.'
-          : 'You have used all 300 free credits for this 30-day cycle. Upgrade to continue.'
+          ? 'No credits remaining for this 30-day cycle. Wait for refresh or upgrade your plan.'
+          : 'Your 300 free credits are used up. Upgrade to keep chatting or wait for your 30-day refresh.'
       );
       setShowProUpgrade(true);
       return false;
@@ -1437,25 +1595,7 @@ export default function App() {
     }
 
     return true;
-  };
-
-  const applyOptimisticCreditSpend = () => {
-    setCredits((prev) => Math.max(0, prev - 1));
-    setBilling((prev) => {
-      if (!prev) return prev;
-      const updated: BillingSummary = {
-        ...prev,
-        dailyCreditsUsed: prev.dailyCreditsUsed + 1,
-        monthlyCreditsRemaining: Math.max(0, prev.monthlyCreditsRemaining - 1),
-      };
-      try {
-        window.localStorage.setItem(STORAGE_BILLING_KEY, JSON.stringify(updated));
-      } catch {
-        // ignore storage error
-      }
-      return updated;
-    });
-  };
+  }, [billing, credits, proPlanId]);
 
   // Immediately transforms to BuilderWorkspace when a message is sent from the first screen
   // without ever interrupting or stopping any other project currently building
@@ -1509,7 +1649,6 @@ export default function App() {
 
     setProjects((prev) => [newProject, ...prev]);
     setActiveProjectId(projectId);
-    applyOptimisticCreditSpend();
     setPrompt('');
     setViewMode('builder');
 
@@ -1572,7 +1711,6 @@ export default function App() {
         p.id === activeProject.id ? { ...p, turns: [...p.turns, newTurn] } : p
       )
     );
-    applyOptimisticCreditSpend();
 
     void runBuilderStream(
       activeProject.id,
@@ -1938,6 +2076,8 @@ export default function App() {
             selectedModel={selectedModel}
             modelsLoading={modelsLoading}
             modelsError={modelsError}
+            authHeaders={getStoredAuthHeaders()}
+            inlineNotice={inlineNotice}
             onSelectModel={setSelectedModel}
             onRetryModels={() => void loadModels(true)}
             onSetView={(view) => {
@@ -1964,6 +2104,12 @@ export default function App() {
               }
             }}
             onSendFollowUp={handleFollowUp}
+            onCheckCanUseAi={checkCanConsumeCredit}
+            onPaymentRequired={(nextBilling, errMsg) => {
+              if (nextBilling) applyBillingSummary(nextBilling);
+              if (errMsg) setInlineNotice(errMsg);
+              setShowProUpgrade(true);
+            }}
             onOpenApps={() => {
               setViewMode('home');
               setActiveTab('apps');
@@ -2025,7 +2171,11 @@ export default function App() {
                 {inlineNotice ? (
                   <p
                     role="status"
-                    className="text-xs font-medium text-[#52525B] tracking-[-0.01em]"
+                    className={`max-w-full px-3 py-1.5 rounded-xl text-xs font-medium tracking-[-0.01em] text-center ${
+                      /credit|limit|upgrade|balance/i.test(inlineNotice)
+                        ? 'bg-red-50 border border-red-200 text-red-700'
+                        : 'text-[#52525B]'
+                    }`}
                   >
                     {inlineNotice}
                   </p>

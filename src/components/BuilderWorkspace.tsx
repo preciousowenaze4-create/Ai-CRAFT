@@ -23,6 +23,7 @@ import {
 import { useSpeechNarration } from '../hooks/useSpeechNarration';
 import { useVoiceDictation } from '../hooks/useVoiceDictation';
 import {
+  BillingSummary,
   BuildMode,
   BuilderTurn,
   ComposerOptions,
@@ -89,12 +90,16 @@ interface BuilderWorkspaceProps {
   selectedModel: string;
   modelsLoading: boolean;
   modelsError: string | null;
+  authHeaders?: Record<string, string>;
+  inlineNotice?: string | null;
   onSelectModel: (modelId: string) => void;
   onRetryModels: () => void;
   onSetView: (view: WorkspaceView) => void;
   onPublish: () => void;
   onBack: () => void;
   onSendFollowUp: (message: string, options: ComposerOptions) => void;
+  onCheckCanUseAi?: () => boolean;
+  onPaymentRequired?: (billing?: BillingSummary | null, errorMessage?: string) => void;
   onOpenApps: () => void;
   onOpenSettings: () => void;
   onOpenUpgrade: () => void;
@@ -114,12 +119,16 @@ export function BuilderWorkspace({
   selectedModel,
   modelsLoading,
   modelsError,
+  authHeaders,
+  inlineNotice,
   onSelectModel,
   onRetryModels,
   onSetView,
   onPublish,
   onBack,
   onSendFollowUp,
+  onCheckCanUseAi,
+  onPaymentRequired,
   onOpenApps,
   onOpenSettings,
   onOpenUpgrade,
@@ -349,10 +358,25 @@ export function BuilderWorkspace({
 
       if (data.type === 'aicraft:ask' && data.id && data.prompt?.trim()) {
         const replyTarget = previewIframeRef.current?.contentWindow;
+        if (onCheckCanUseAi && !onCheckCanUseAi()) {
+          replyTarget?.postMessage(
+            {
+              type: 'aicraft:reply',
+              id: data.id,
+              error: 'No credit balance remaining. Upgrade to continue chatting with AI.',
+            },
+            '*'
+          );
+          return;
+        }
+
         try {
           const response = await fetch('/api/craft/stream', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(authHeaders || {}),
+            },
             body: JSON.stringify({
               message: data.prompt.trim(),
               mode,
@@ -363,7 +387,22 @@ export function BuilderWorkspace({
             }),
           });
           if (!response.ok || !response.body) {
-            throw new Error('Unable to reach AI Craft engine.');
+            let errMessage = 'Unable to reach AI Craft engine.';
+            try {
+              const errJson = (await response.json()) as {
+                error?: string;
+                billing?: BillingSummary;
+              };
+              if (errJson.error) errMessage = errJson.error;
+              if (response.status === 402) {
+                onPaymentRequired?.(errJson.billing ?? null, errMessage);
+              }
+            } catch {
+              if (response.status === 402) {
+                onPaymentRequired?.(null, errMessage);
+              }
+            }
+            throw new Error(errMessage);
           }
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
@@ -421,7 +460,16 @@ export function BuilderWorkspace({
 
     window.addEventListener('message', handleBridgeMessage);
     return () => window.removeEventListener('message', handleBridgeMessage);
-  }, [mode, selectedModel, onSetView, onSendFollowUp]);
+  }, [
+    authHeaders,
+    mode,
+    onCheckCanUseAi,
+    onPaymentRequired,
+    onSendFollowUp,
+    onSetView,
+    selectedModel,
+    webSearchEnabled,
+  ]);
 
   // Zero-lag rAF auto-scroll while streaming
   useEffect(() => {
@@ -1269,22 +1317,32 @@ export function BuilderWorkspace({
       {/* Bottom Follow-Up Chat Composer */}
       <div className="shrink-0 w-full bg-white border-t border-black/[0.05] pb-safe">
         <div className="w-full max-w-[520px] mx-auto px-4 pt-2 pb-2.5">
+          {inlineNotice ? (
+            <p
+              role="status"
+              className="mb-1.5 px-3 py-1.5 rounded-xl bg-red-50 border border-red-200 text-[12px] font-medium text-red-700 text-center"
+            >
+              {inlineNotice}
+            </p>
+          ) : null}
           {/* Micro Status Strip above Composer */}
           <div className="px-1 pb-2 flex items-center justify-between text-[13.5px]">
             <div className="flex items-center gap-3">
               <button
                 type="button"
                 onClick={onOpenUpgrade}
-                aria-label={`AI Craft credits: ${credits}. Tap to upgrade or add credits`}
+                aria-label={`AI Craft credits: ${credits.toLocaleString()}. Tap to upgrade or add credits`}
                 className="flex items-center gap-1.5 rounded-full px-1.5 py-1 -ml-1.5 hover:bg-black/[0.04] active:scale-95 transition-all"
               >
                 <span
                   className="w-[18px] h-[18px] rounded-full flex items-center justify-center shrink-0"
                   style={{
                     background:
-                      mode === 'mobile'
-                        ? 'linear-gradient(135deg, #C4B5FD 0%, #7A68F6 60%, #5B21B6 100%)'
-                        : 'linear-gradient(135deg, #F0ABFC 0%, #8B5CF6 60%, #6D28D9 100%)',
+                      credits <= 0
+                        ? 'linear-gradient(135deg, #FCA5A5 0%, #EF4444 65%, #B91C1C 100%)'
+                        : mode === 'mobile'
+                          ? 'linear-gradient(135deg, #C4B5FD 0%, #7A68F6 60%, #5B21B6 100%)'
+                          : 'linear-gradient(135deg, #F0ABFC 0%, #8B5CF6 60%, #6D28D9 100%)',
                   }}
                   aria-hidden="true"
                 >
@@ -1296,8 +1354,12 @@ export function BuilderWorkspace({
                     />
                   </svg>
                 </span>
-                <span className="font-display font-semibold text-[#111118] tabular-nums">
-                  {credits}
+                <span
+                  className={`font-display font-semibold tabular-nums ${
+                    credits <= 0 ? 'text-red-600' : 'text-[#111118]'
+                  }`}
+                >
+                  {credits.toLocaleString()}
                 </span>
               </button>
 

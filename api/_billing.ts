@@ -574,6 +574,133 @@ export async function upgradeUserAccountFromTransaction(params: {
   return upgraded.state;
 }
 
+export const BYTES_PER_BUILD_CREDIT = 1350;
+export const MAX_CREDITS_PER_BUILD = 20;
+
+export function calculateBuildCreditsForBytes(bytesBuilt: number): number {
+  if (!Number.isFinite(bytesBuilt) || bytesBuilt <= 0) return 0;
+  return Math.min(
+    MAX_CREDITS_PER_BUILD,
+    Math.max(1, Math.floor(bytesBuilt / BYTES_PER_BUILD_CREDIT) + 1)
+  );
+}
+
+export interface VerifiedGenerationContext {
+  user: SupabaseUser;
+  accessToken: string;
+  refreshToken?: string;
+  state: BillingAccountState;
+}
+
+export async function verifyUserCanGenerate(
+  request: Request
+): Promise<
+  | {
+      allowed: true;
+      context: VerifiedGenerationContext | null;
+      billing: BillingSummaryPayload | null;
+    }
+  | {
+      allowed: false;
+      status: number;
+      code: string;
+      error: string;
+      billing: BillingSummaryPayload;
+    }
+> {
+  const { accessToken, refreshToken } = extractAuthTokensFromRequest(request);
+  if (!accessToken && !refreshToken) {
+    return { allowed: true, context: null, billing: null };
+  }
+
+  const auth = await getAuthenticatedSupabaseUser(accessToken, refreshToken);
+  if (!auth.user) {
+    return { allowed: true, context: null, billing: null };
+  }
+
+  const current = await reconcileAndLoadBillingState({
+    user: auth.user,
+    accessToken: auth.accessToken,
+    refreshToken: auth.refreshToken,
+    checkPaystack: false,
+  });
+
+  const check = consumeBillingCredit(current, 1, Date.now());
+  if (!check.allowed) {
+    return {
+      allowed: false,
+      status: 402,
+      code: check.code || 'LIMIT_REACHED',
+      error: check.error || 'Credit limit reached.',
+      billing: serializeBillingSummary(check.state),
+    };
+  }
+
+  return {
+    allowed: true,
+    context: {
+      user: auth.user,
+      accessToken: auth.accessToken,
+      refreshToken: auth.refreshToken,
+      state: current,
+    },
+    billing: serializeBillingSummary(current),
+  };
+}
+
+export async function commitGenerationCredits(
+  context: VerifiedGenerationContext | null,
+  rawAmount: number
+): Promise<BillingSummaryPayload | null> {
+  if (!context) return null;
+  const amount = Math.max(0, Math.floor(rawAmount));
+  if (amount <= 0) {
+    return serializeBillingSummary(context.state);
+  }
+
+  const nowMs = Date.now();
+  const freshAuth = await getAuthenticatedSupabaseUser(
+    context.accessToken,
+    context.refreshToken
+  );
+  const activeUser = freshAuth.user || context.user;
+  const latestState = await reconcileAndLoadBillingState({
+    user: activeUser,
+    accessToken: freshAuth.accessToken || context.accessToken,
+    refreshToken: freshAuth.refreshToken || context.refreshToken,
+    checkPaystack: false,
+  });
+
+  const plan = getPlanConfig(latestState.tier);
+  const dailyHeadroom =
+    plan.dailyLimit !== null
+      ? Math.max(0, plan.dailyLimit - latestState.dailyCreditsUsed)
+      : amount;
+  const effectiveAmount = Math.min(
+    amount,
+    latestState.monthlyCreditsRemaining,
+    dailyHeadroom
+  );
+
+  if (effectiveAmount <= 0) {
+    return serializeBillingSummary(latestState);
+  }
+
+  const consumed = consumeBillingCredit(latestState, effectiveAmount, nowMs);
+  if (!consumed.allowed) {
+    return serializeBillingSummary(consumed.state);
+  }
+
+  await saveUserBillingState({
+    user: activeUser,
+    state: consumed.state,
+    accessToken: freshAuth.accessToken || context.accessToken,
+    refreshToken: freshAuth.refreshToken || context.refreshToken,
+  });
+
+  return serializeBillingSummary(consumed.state);
+}
+
 export async function enforceAndConsumeGenerationCredit(
   request: Request,
   amount = 1

@@ -1,5 +1,9 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
-import { enforceAndConsumeGenerationCredit } from '../_billing.js';
+import {
+  calculateBuildCreditsForBytes,
+  commitGenerationCredits,
+  verifyUserCanGenerate,
+} from '../_billing.js';
 
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
@@ -1050,7 +1054,7 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: 'Prompt message is required.' }, { status: 400 });
   }
 
-  const creditCheck = await enforceAndConsumeGenerationCredit(request, 1);
+  const creditCheck = await verifyUserCanGenerate(request);
   if (!creditCheck.allowed) {
     return Response.json(
       {
@@ -1283,6 +1287,9 @@ export async function POST(request: Request): Promise<Response> {
         let emittedFiles: string[] = [];
         let emittedPlanSteps: string[] = [];
         let lastProgressSentAt = 0;
+        let buildCreditsEmitted = 0;
+        let lastCreditEmitAt = 0;
+        let creditsCommitted = false;
         let modelUsed = '';
         let noticedReasoning = false;
 
@@ -1291,7 +1298,8 @@ export async function POST(request: Request): Promise<Response> {
             emittedProseLength > 0 ||
             emittedFiles.length > 0 ||
             emittedPlanSteps.length > 0 ||
-            emittedBuildPhase
+            emittedBuildPhase ||
+            buildCreditsEmitted > 0
           ) {
             sendEvent({ type: 'reset' });
           }
@@ -1306,6 +1314,8 @@ export async function POST(request: Request): Promise<Response> {
           emittedFiles = [];
           emittedPlanSteps = [];
           lastProgressSentAt = 0;
+          buildCreditsEmitted = 0;
+          lastCreditEmitAt = 0;
           noticedReasoning = false;
         };
 
@@ -1369,6 +1379,20 @@ export async function POST(request: Request): Promise<Response> {
             sendEvent({
               type: 'progress',
               bytesBuilt: cleanHtml.length,
+            });
+          }
+
+          const targetCredits = calculateBuildCreditsForBytes(cleanHtml.length);
+          if (
+            targetCredits > buildCreditsEmitted &&
+            (buildCreditsEmitted === 0 || nowMs - lastCreditEmitAt >= 900)
+          ) {
+            buildCreditsEmitted += 1;
+            lastCreditEmitAt = nowMs;
+            sendEvent({
+              type: 'credits',
+              used: buildCreditsEmitted,
+              targetUsed: targetCredits,
             });
           }
         };
@@ -1756,6 +1780,10 @@ export async function POST(request: Request): Promise<Response> {
         }
 
         if (request.signal.aborted) {
+          if (!creditsCommitted && resolvedKind === 'build' && buildCreditsEmitted > 0) {
+            creditsCommitted = true;
+            await commitGenerationCredits(creditCheck.context, buildCreditsEmitted).catch(() => null);
+          }
           closeStream();
           return;
         }
@@ -1803,6 +1831,19 @@ export async function POST(request: Request): Promise<Response> {
           }
         }
 
+        const finalCreditsUsed =
+          resolvedKind === 'build' && (previewHtml.length > 0 || finalFiles.length > 0)
+            ? Math.max(1, calculateBuildCreditsForBytes(previewHtml.length))
+            : 0;
+        let updatedBilling = creditCheck.billing;
+        if (finalCreditsUsed > 0 && !creditsCommitted) {
+          creditsCommitted = true;
+          updatedBilling =
+            (await commitGenerationCredits(creditCheck.context, finalCreditsUsed).catch(
+              () => null
+            )) ?? creditCheck.billing;
+        }
+
         const finalInfo = resolveModelInfo(modelUsed, catalog);
         sendEvent({
           type: 'done',
@@ -1812,6 +1853,8 @@ export async function POST(request: Request): Promise<Response> {
           allFiles: finalFiles,
           suggestions: finalSuggestions,
           bytesBuilt: previewHtml.length,
+          creditsUsed: finalCreditsUsed,
+          billing: updatedBilling,
           modelUsed: finalInfo.id,
           modelName: finalInfo.name,
           provider: finalInfo.provider,
