@@ -21,6 +21,8 @@ import {
   commitGenerationCredits,
   consumeBillingCredit,
   getAuthenticatedSupabaseUser,
+  getAvailableCreditsBudget,
+  getCreditExhaustionInfo,
   loadCloudWorkspace,
   reconcileAndLoadBillingState,
   saveCloudWorkspace,
@@ -1103,6 +1105,37 @@ ${rawHtml}
   return assembleHtmlFromScatteredBlocks(raw);
 }
 
+function finalizePartialPreviewHtml(raw: string): string {
+  let html = extractPreviewHtmlFromRaw(raw);
+  if (!html) return '';
+
+  const lastOpenBracket = html.lastIndexOf('<');
+  const lastCloseBracket = html.lastIndexOf('>');
+  if (lastOpenBracket > lastCloseBracket && lastOpenBracket > 0) {
+    html = html.slice(0, lastOpenBracket).trimEnd();
+  }
+
+  const lastScriptOpen = html.toLowerCase().lastIndexOf('<script');
+  const lastScriptClose = html.toLowerCase().lastIndexOf('</script>');
+  if (lastScriptOpen > lastScriptClose) {
+    const lastNewline = html.lastIndexOf('\n');
+    if (lastNewline > lastScriptOpen) {
+      html = html.slice(0, lastNewline);
+    }
+    html += '\n</script>';
+  }
+
+  const lastStyleOpen = html.toLowerCase().lastIndexOf('<style');
+  const lastStyleClose = html.toLowerCase().lastIndexOf('</style>');
+  if (lastStyleOpen > lastStyleClose) {
+    html += '\n</style>';
+  }
+
+  if (!/<\/body>/i.test(html)) html += '\n</body>';
+  if (!/<\/html>/i.test(html)) html += '\n</html>';
+  return html;
+}
+
 function extractPreviewStructureSummary(previousHtml: string): string {
   if (!previousHtml.trim()) return '';
   const items = extractLiveBuildArtifacts(previousHtml).map((a) => `${a.action} ${a.path}`);
@@ -1416,11 +1449,11 @@ function extractLiveBuildArtifacts(htmlSoFar: string): LiveBuildArtifact[] {
 
 interface CraftJob {
   id: string;
-  status: 'running' | 'complete' | 'error';
+  status: 'running' | 'paused' | 'complete' | 'error';
   startedAt: number;
   updatedAt: number;
   kind: 'chat' | 'build';
-  phase: 'understanding' | 'building' | 'complete' | 'error';
+  phase: 'understanding' | 'building' | 'paused' | 'complete' | 'error';
   phaseLabel: string;
   modelId?: string;
   modelName?: string;
@@ -1432,6 +1465,9 @@ interface CraftJob {
   suggestions: string[];
   dbTables: ParsedDbTable[];
   bytesBuilt: number;
+  creditsUsed?: number;
+  pausedReason?: string;
+  pausedMessage?: string;
   aiText: string;
   previewHtml: string;
   errorMessage?: string;
@@ -1460,6 +1496,9 @@ function serializeJobSnapshot(job: CraftJob) {
     suggestions: job.suggestions,
     dbTables: job.dbTables,
     bytesBuilt: job.bytesBuilt,
+    creditsUsed: job.creditsUsed,
+    pausedReason: job.pausedReason,
+    pausedMessage: job.pausedMessage,
     aiText: job.aiText,
     previewHtml: job.previewHtml,
     errorMessage: job.errorMessage,
@@ -1537,6 +1576,30 @@ async function startServer() {
       job.bytesBuilt = 0;
     } else if (type === 'delta' && typeof payload.text === 'string') {
       job.aiText += payload.text;
+    } else if (type === 'paused') {
+      job.status = 'paused';
+      job.phase = 'paused';
+      job.kind = 'build';
+      job.phaseLabel = 'Paused · 0 tokens left';
+      job.pausedReason =
+        typeof payload.reason === 'string' ? payload.reason : 'MONTHLY_LIMIT_REACHED';
+      job.pausedMessage =
+        typeof payload.message === 'string'
+          ? payload.message
+          : 'Credits finished during build.';
+      if (typeof payload.fullText === 'string') job.aiText = payload.fullText;
+      if (typeof payload.previewHtml === 'string') job.previewHtml = payload.previewHtml;
+      if (Array.isArray(payload.allFiles)) {
+        job.files = payload.allFiles.filter((f): f is string => typeof f === 'string');
+      }
+      if (Array.isArray(payload.dbTables)) {
+        job.dbTables = payload.dbTables as ParsedDbTable[];
+      }
+      if (typeof payload.bytesBuilt === 'number') job.bytesBuilt = payload.bytesBuilt;
+      if (typeof payload.creditsUsed === 'number') job.creditsUsed = payload.creditsUsed;
+      if (typeof payload.modelUsed === 'string') job.modelId = payload.modelUsed;
+      if (typeof payload.modelName === 'string') job.modelName = payload.modelName;
+      if (typeof payload.provider === 'string') job.provider = payload.provider;
     } else if (type === 'done') {
       job.status = 'complete';
       job.phase = 'complete';
@@ -1554,6 +1617,7 @@ async function startServer() {
         job.dbTables = payload.dbTables as ParsedDbTable[];
       }
       if (typeof payload.bytesBuilt === 'number') job.bytesBuilt = payload.bytesBuilt;
+      if (typeof payload.creditsUsed === 'number') job.creditsUsed = payload.creditsUsed;
       if (typeof payload.modelUsed === 'string') job.modelId = payload.modelUsed;
       if (typeof payload.modelName === 'string') job.modelName = payload.modelName;
       if (typeof payload.provider === 'string') job.provider = payload.provider;
@@ -1571,7 +1635,7 @@ async function startServer() {
     for (const subscriber of Array.from(job.subscribers)) {
       if (!subscriber.writableEnded) {
         subscriber.write(encoded);
-        if (type === 'done' || type === 'error') {
+        if (type === 'done' || type === 'paused' || type === 'error') {
           subscriber.end();
           job.subscribers.delete(subscriber);
         }
@@ -2469,6 +2533,30 @@ async function startServer() {
           suggestions: job.suggestions,
           dbTables: job.dbTables,
           bytesBuilt: job.bytesBuilt,
+          creditsUsed: job.creditsUsed,
+          modelUsed: job.modelId,
+          modelName: job.modelName,
+          provider: job.provider,
+          startedAt: job.startedAt,
+        })}\n\n`
+      );
+      res.end();
+      return;
+    }
+
+    if (job.status === 'paused') {
+      res.write(
+        `data: ${JSON.stringify({
+          type: 'paused',
+          reason: job.pausedReason || 'MONTHLY_LIMIT_REACHED',
+          message: job.pausedMessage || 'Remaining credits finished during build.',
+          kind: 'build',
+          fullText: job.aiText,
+          previewHtml: job.previewHtml,
+          allFiles: job.files,
+          dbTables: job.dbTables,
+          bytesBuilt: job.bytesBuilt,
+          creditsUsed: job.creditsUsed,
           modelUsed: job.modelId,
           modelName: job.modelName,
           provider: job.provider,
@@ -2634,7 +2722,9 @@ async function startServer() {
         attachmentMimeType?: string | null;
         attachmentText?: string | null;
         secretKeys?: string[];
+        secretHints?: Array<{ key?: string; hint?: string }>;
         databaseTables?: string[];
+        clientCreditsRemaining?: number;
       };
     };
 
@@ -2670,12 +2760,29 @@ async function startServer() {
           .map((k) => k.trim())
           .slice(0, 30)
       : [];
+    const secretHints = Array.isArray(options.secretHints)
+      ? options.secretHints
+          .filter(
+            (item): item is { key: string; hint: string } =>
+              Boolean(item && typeof item.key === 'string' && item.key.trim().length > 0)
+          )
+          .map((item) => ({
+            key: item.key.trim(),
+            hint: typeof item.hint === 'string' && item.hint.trim() ? item.hint.trim() : 'configured-secret',
+          }))
+          .slice(0, 30)
+      : secretKeys.map((key) => ({ key, hint: 'configured-secret' }));
     const databaseTables = Array.isArray(options.databaseTables)
       ? options.databaseTables
           .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
           .map((t) => t.trim())
           .slice(0, 20)
       : [];
+    const clientCreditsHint =
+      typeof options.clientCreditsRemaining === 'number' &&
+      Number.isFinite(options.clientCreditsRemaining)
+        ? Math.max(0, Math.floor(options.clientCreditsRemaining))
+        : null;
 
     if (!message) {
       res.status(400).json({ error: 'Prompt message is required.' });
@@ -2684,6 +2791,7 @@ async function startServer() {
 
     let generationCreditContext: VerifiedGenerationContext | null = null;
     let initialBillingSummary = null;
+    let serverCreditBudget: number | null = null;
     {
       const cookies = parseCookies(req.headers.cookie);
       const authHeader = req.headers.authorization || '';
@@ -2723,9 +2831,12 @@ async function startServer() {
             state: currentBilling,
           };
           initialBillingSummary = serializeBillingSummary(currentBilling);
+          serverCreditBudget = getAvailableCreditsBudget(currentBilling, Date.now());
         }
       }
     }
+    const effectiveCreditBudget =
+      serverCreditBudget !== null ? serverCreditBudget : clientCreditsHint;
 
     pruneOldJobs();
 
@@ -2848,16 +2959,23 @@ async function startServer() {
         activeFlags.push(`Existing project database tables: ${databaseTables.join('; ')}`);
       }
 
+      const effectiveKeysSummary =
+        secretHints.length > 0
+          ? secretHints.map((s) => `${s.key} (${s.hint})`).join(', ')
+          : secretKeys.join(', ');
+
       const projectInfraContext = [
-        'PROJECT SECRETS & REAL-TIME DATABASE INFRASTRUCTURE:',
-        secretKeys.length > 0
-          ? `- Saved project Secret keys available at runtime in this app: ${secretKeys.join(', ')}.`
-          : '- No project Secret keys saved yet. Users can add API keys/tokens anytime via the "Secrets" button in the bottom composer toolbar (+ Add secret -> Apply changes).',
-        '- Where project Secrets live at runtime: In generated apps, read any secret safely via `window.AICraft?.getSecret("KEY_NAME") || window.ENV?.KEY_NAME || window.__AICRAFT_ENV__?.KEY_NAME || (typeof process !== "undefined" && process.env ? process.env.KEY_NAME : "") || ""`. Never hardcode secret values.',
+        'PROJECT SECRETS & REAL-TIME DATABASE INFRASTRUCTURE (CRITICAL — READ CAREFULLY):',
+        secretHints.length > 0
+          ? `- Saved project Secrets configured in this project right now (values are securely injected at runtime in Preview — NEVER ask the user to paste keys into chat): ${effectiveKeysSummary}.`
+          : '- No project Secret keys saved yet. Users add any API key/token anytime via the "Secrets" button in the bottom composer toolbar (+ Add secret -> Apply changes).',
+        '- RUNTIME SECRETS DISCOVERY: In generated HTML apps, read secrets using `window.AICraft.getSecret("EXACT_KEY")` OR smart pattern lookup `window.AICraft.findSecret("pattern1", "pattern2", ...)` (which searches both custom key names AND credential types, e.g. `findSecret("SUPABASE_URL", "supabase_url", "supabase")` finds user-named keys like `MY_SUPABASE` or `SUPABASE`). All secrets are also available on `window.AICraft.env`, `window.ENV`, `window.__AICRAFT_ENV__`, and `process.env`.',
+        '- RULE WHEN USER SAYS KEYS ARE IN SECRETS: Whenever the user says they pasted a key into Secrets (e.g., "I already pasted my Supabase in the secret", "I added Google key", etc.), immediately inspect the configured Secret keys & detected types above. Locate the matching key name(s) accurately, wire them directly into the generated app code using both `getSecret("EXACT_KEY")` and `findSecret(...)` fallback, and explicitly confirm which exact key name(s) you connected. If a companion key is still missing (for example Supabase Project URL is present without the Anon/Publishable key), clearly tell the user which exact missing key name to add in the Secrets drawer.',
         databaseTables.length > 0
           ? `- Existing structured project Database tables: ${databaseTables.join('; ')}.`
-          : '- The project Database drawer automatically captures and structures tables in real time as the app is built and used — users never manually input Supabase keys or table forms.',
-        '- Real-time Database API: Generated apps persist data with `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, `await window.AICraft.db.remove("table", id)`.',
+          : '- The project Database drawer automatically captures and structures real-time tables as the app is built and used — users never manually enter Supabase URLs or table forms inside Database.',
+        '- REAL SUPABASE + GOOGLE LOGIN + REAL DATABASE WIRING: When Supabase secrets (`supabase-project-url` and `supabase-anon-key`/`jwt-token`/`supabase-credential`) are configured in Secrets OR requested by the user (e.g. WhatsApp/chat app with Google Login & real DB): load `@supabase/supabase-js@2` via `<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>`, initialize `window.supabase.createClient(sbUrl, sbKey)` using the exact key names found in Secrets (`getSecret` + `findSecret` fallback), wire real `supabaseClient.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })` + `onAuthStateChange` + real `supabaseClient.from(table).select/insert/update/delete`, AND sync records into `window.AICraft.db` (`list`, `insert`, `update`, `remove`) while emitting `[[DB_SCHEMA: ...]]` lines so BOTH real cloud Postgres AND AI Craft Database explorer reflect real live data.',
+        '- BUILT-IN REAL-TIME DATABASE API: For every app with data persistence, persist records via `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, `await window.AICraft.db.remove("table", id)`.',
       ].join('\n');
 
       const previewSummary = extractPreviewStructureSummary(previousHtml);
@@ -2868,19 +2986,19 @@ async function startServer() {
         'STEP 0 (Architectural Planning & Structured Database Lines): Output 4 short planning lines using exact format `[[PLAN: <step>]]` covering:',
         '  1) `[[PLAN: Color palette & typography — ...]]` (choose a refined, harmonious color palette, high-contrast surfaces, crisp font hierarchy)',
         '  2) `[[PLAN: Layout & button placement — ...]]` (plan clean visual structure, thumb-friendly 44px+ buttons, intuitive header & bottom nav placement, balanced spacing)',
-        '  3) `[[PLAN: Real-time features & live media — ...]]` (plan real clocks/timers, `window.AICraft.db` persistence, live `window.AICraft.search(query)` / `window.AICraft.ask(prompt)`, and verified search images or crisp inline SVGs)',
+        '  3) `[[PLAN: Real-time features, secrets & database — ...]]` (plan real clocks/timers, real Secrets integration if needed, `window.AICraft.db` / Supabase persistence, live `window.AICraft.search(query)` / `window.AICraft.ask(prompt)`, and verified search images or crisp inline SVGs)',
         '  4) `[[PLAN: Monetization & growth flow — ...]]` (plan built-in interactive monetization tailored to the app: Pro/Premium plan sheet, monthly/annual toggle, credits/checkout drawer, creator tips, or revenue metrics)',
-        'STEP 0B (Automatic Real-Time Database Schema Lines): Whenever the app you are building stores or manages data (e.g. a TikTok-style app -> `profiles`, `videos`, `comments`, `likes`; a store -> `products`, `orders`; a tracker -> `entries`), IMMEDIATELY output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Example: `[[DB_SCHEMA: profiles(id:text, username:text, bio:text, followers_count:number, created_at:timestamp)]]`.',
-        'PART 1 (Architectural Overview & Feedback): Write 2–3 calm, clear plain-text sentences summarizing the structure, color choices, button layout, real-time database/features, and monetization you built, plus brief feedback on how it can grow next. If the app integrates an external API key or uses project secrets, mention the exact key name stored in Secrets. ABSOLUTELY PROHIBITED IN PART 1: NEVER include raw code, HTML tags, CSS, JS, markdown code fences (```), backticks, or the words "PART 1" / "PART 2" / "PART 3", and NEVER tell the user to copy/paste code.',
+        'STEP 0B (Automatic Real-Time Database Schema Lines): Whenever the app you are building stores or manages data (e.g. WhatsApp -> `users`, `chats`, `messages`; TikTok -> `profiles`, `videos`, `comments`, `likes`; store -> `products`, `orders`), IMMEDIATELY output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Example: `[[DB_SCHEMA: messages(id:text, chat_id:text, sender_id:text, body:text, created_at:timestamp)]]`.',
+        'PART 1 (Architectural Overview & Feedback): Write 2–3 calm, clear plain-text sentences summarizing the structure, color choices, button layout, real-time database/features, connected Secrets keys (if any), and monetization you built, plus brief feedback on how it can grow next. ABSOLUTELY PROHIBITED IN PART 1: NEVER include raw code, HTML tags, CSS, JS, markdown code fences (```), backticks, or the words "PART 1" / "PART 2" / "PART 3", and NEVER tell the user to copy/paste code.',
         'PART 2 (Full-Screen Real-Time App): On a new line immediately output the exact marker <<<AICRAFT_APP_HTML>>> followed by a complete, thoughtfully crafted, self-contained, runnable <!DOCTYPE html> application ending with <<<END_AICRAFT_APP_HTML>>>.',
         'Rules for the HTML app in PART 2:',
         `- Design it as a refined ${targetLabel} experience inside AI Craft's full-screen Preview tab.`,
         '- COHESIVE COLOR & ERGONOMIC BUTTONS: Craft a polished color system (clean surface hierarchy, tasteful accent, accessible contrast), smooth transitions, and well-placed >= 44px touch-target buttons (clear primary CTA, uncluttered header, intuitive navigation).',
-        '- REAL-TIME STRUCTURED DATABASE & PERSISTENCE: Persist all app data via `window.AICraft.db` (`list`, `insert`, `update`, `remove`). On first load, if `await window.AICraft.db.list(table)` is empty, seed 2–4 realistic starter rows via `window.AICraft.db.insert(...)` so the app and live Database drawer work immediately.',
-        '- PROJECT SECRETS ACCESS: When calling any external API or using configured keys, always read `const apiKey = window.AICraft?.getSecret?.("KEY_NAME") || window.ENV?.KEY_NAME || process?.env?.KEY_NAME || "";` cleanly with graceful UI handling if a key has not been added to Secrets yet.',
+        '- REAL-TIME STRUCTURED DATABASE & PERSISTENCE: Persist all app data via `window.AICraft.db` (`list`, `insert`, `update`, `remove`) — and when Supabase secrets exist, connect real `@supabase/supabase-js@2` queries + auth synced seamlessly with `window.AICraft.db`. On first load, if `await window.AICraft.db.list(table)` is empty, seed 2–4 realistic starter rows via `window.AICraft.db.insert(...)` so the app and live Database drawer work immediately.',
+        '- PROJECT SECRETS ACCESS & REAL INTEGRATIONS: Never hardcode API keys. Always resolve secrets via `window.AICraft?.getSecret?.("EXACT_KEY") || window.AICraft?.findSecret?.("alias1", "alias2") || window.ENV?.EXACT_KEY || ""`. Handle missing keys cleanly in-app by showing which key name to paste in the AI Craft Secrets drawer.',
         '- BUILD & MONETIZE IN REAL TIME: Every app must include working interactive flows, real-time clock/date or live timers, plus a genuine interactive monetization feature tailored naturally to the app (such as a working Pro/Premium upgrade modal with monthly/annual switch, interactive checkout/wallet flow, creator tip jar, featured/sponsored tier, or live revenue/MRR widget).',
         '- GOOGLE/WEB SEARCH & REAL IMAGES: Use `await window.AICraft.search(query)` (automatically injected in Preview—returns `{ query, results, images }` with real snippets and `imageUrl`) and `await window.AICraft.ask(prompt)` for live AI responses/content. If you embed verified `https://` image URLs from the search grounding above, always include a clean `onerror` fallback so broken icons never appear; otherwise use crisp inline SVGs and CSS gradients.',
-        '- SURGICAL SCREENSHOT & PREVIEW EDITING: When updating an existing Preview app or inspecting an attached screenshot, identify precisely what the user wants removed/cut vs. kept, remove ONLY what was requested, preserve everything else cleanly, and output the complete updated <!DOCTYPE html> app.',
+        '- SURGICAL EDITING & CONTINUE RESUME: When updating an existing Preview app, inspecting an attached screenshot, OR resuming a paused build (`[[CONTINUE_BUILD]]`), inspect `previousHtml` carefully, preserve all working progress & data, complete any unfinished sections/logic cleanly, and output the complete runnable <!DOCTYPE html> app.',
         '- Organize multi-screen apps (like Feed, Discover, Pricing/Pro, Checkout, Profile, Settings, Dashboard) using semantic `<section id="...">`, `<nav>`, `<header>` tags.',
         '- Full-screen layout (`min-height: 100dvh; width: 100%; margin: 0;`) unless the user specifically asks for a compact widget.',
         'PART 3 (Next Suggested Upgrades): Immediately AFTER <<<END_AICRAFT_APP_HTML>>>, output:',
@@ -2904,8 +3022,8 @@ async function startServer() {
             : '',
           'Respond directly and conversationally in real time to the user message.',
           'The user is chatting or asking a question right now — reply naturally without rebuilding the app or outputting HTML code.',
-          'If asked about project Secrets or API keys, clearly reference the configured key names above and explain they live in the Secrets button inside the composer toolbar (`window.AICraft.getSecret("KEY")`, `window.ENV`, `process.env`).',
-          'If asked about the Database, explain the structured tables built for this app in the Database button inside the composer toolbar (`window.AICraft.db`).',
+          'If asked about project Secrets or API keys, inspect the configured Secret keys & detected types above, name the exact key(s) you see (e.g. SUPABASE_URL / MY_SUPABASE), and confirm whether everything needed is present or which exact key should be added in the Secrets button.',
+          'If asked about the Database, explain the structured tables built for this app in the Database button inside the composer toolbar (`window.AICraft.db` and connected Supabase Postgres when configured).',
           'NEVER tell the user to copy and paste code. If they later ask you to build or change the app, you will build it into Preview.',
           'If the user asks for the current time, date, or day, use the real-time clock context above accurately.',
           'Keep formatting clean and readable.',
@@ -3003,6 +3121,15 @@ async function startServer() {
       let lastCreditEmitAt = 0;
       let modelUsed = '';
       let noticedReasoning = false;
+      let pausedDueToCredits = false;
+
+      const triggerCreditPause = () => {
+        if (pausedDueToCredits) return;
+        pausedDueToCredits = true;
+        if (!clientAbort.signal.aborted) {
+          clientAbort.abort();
+        }
+      };
 
       const resetStreamParser = () => {
         if (
@@ -3070,6 +3197,10 @@ async function startServer() {
 
       const promoteToBuildPhase = () => {
         resolvedKind = 'build';
+        if (effectiveCreditBudget !== null && effectiveCreditBudget <= 0) {
+          triggerCreditPause();
+          return;
+        }
         if (!emittedBuildPhase) {
           emittedBuildPhase = true;
           sendEvent({
@@ -3110,8 +3241,13 @@ async function startServer() {
         }
 
         const targetCredits = calculateBuildCreditsForBytes(cleanHtml.length);
+        const cappedTargetCredits =
+          effectiveCreditBudget !== null
+            ? Math.min(targetCredits, effectiveCreditBudget)
+            : targetCredits;
+
         if (
-          targetCredits > buildCreditsEmitted &&
+          cappedTargetCredits > buildCreditsEmitted &&
           (buildCreditsEmitted === 0 || nowMs - lastCreditEmitAt >= 900)
         ) {
           buildCreditsEmitted += 1;
@@ -3119,8 +3255,24 @@ async function startServer() {
           sendEvent({
             type: 'credits',
             used: buildCreditsEmitted,
-            targetUsed: targetCredits,
+            targetUsed: cappedTargetCredits,
           });
+        }
+
+        if (
+          effectiveCreditBudget !== null &&
+          (targetCredits > effectiveCreditBudget ||
+            (effectiveCreditBudget > 0 &&
+              buildCreditsEmitted >= effectiveCreditBudget &&
+              cleanHtml.length > effectiveCreditBudget * 1350))
+        ) {
+          buildCreditsEmitted = effectiveCreditBudget;
+          sendEvent({
+            type: 'credits',
+            used: effectiveCreditBudget,
+            targetUsed: effectiveCreditBudget,
+          });
+          triggerCreditPause();
         }
       };
 
@@ -3303,7 +3455,7 @@ async function startServer() {
 
         for (let i = 0; i < candidates.length; i += 1) {
           const candidateId = candidates[i];
-          if (clientAbort.signal.aborted) break;
+          if (clientAbort.signal.aborted || pausedDueToCredits) break;
 
           const modelInfo = resolveModelInfo(candidateId);
 
@@ -3352,6 +3504,11 @@ async function startServer() {
 
             flushPendingStreamBuffer();
 
+            if (pausedDueToCredits) {
+              modelUsed = candidateId;
+              break;
+            }
+
             if (!fullRaw.trim()) {
               throw new Error(`Model ${candidateId} returned an empty response.`);
             }
@@ -3369,6 +3526,10 @@ async function startServer() {
             succeeded = true;
             break;
           } catch (err) {
+            if (pausedDueToCredits) {
+              modelUsed = candidateId;
+              break;
+            }
             if (clientAbort.signal.aborted) break;
             const errMsg = err instanceof Error ? err.message : String(err);
             const isGenuineInvalidKey =
@@ -3395,7 +3556,7 @@ async function startServer() {
       }
 
       // 2. Final Backend Fallback to Gemini if OpenRouter is unconfigured or all candidates failed
-      if (!succeeded && geminiClient && !clientAbort.signal.aborted) {
+      if (!succeeded && !pausedDueToCredits && geminiClient && !clientAbort.signal.aborted) {
         try {
           if (openRouterKey) {
             resetStreamParser();
@@ -3500,29 +3661,109 @@ async function startServer() {
           }
 
           for await (const chunk of stream) {
-            if (clientAbort.signal.aborted) break;
+            if (clientAbort.signal.aborted || pausedDueToCredits) break;
             if (chunk.text) {
               handleTextChunk(chunk.text);
+              if (pausedDueToCredits) break;
             }
           }
 
           flushPendingStreamBuffer();
 
-          if (!fullRaw.trim()) {
-            throw new Error('Fallback AI engine returned an empty response.');
-          }
+          if (pausedDueToCredits) {
+            modelUsed = 'google/gemini-4-hydrogen';
+          } else {
+            if (!fullRaw.trim()) {
+              throw new Error('Fallback AI engine returned an empty response.');
+            }
 
-          modelUsed = 'google/gemini-4-hydrogen';
-          succeeded = true;
+            modelUsed = 'google/gemini-4-hydrogen';
+            succeeded = true;
+          }
         } catch (err) {
-          lastError = err instanceof Error ? err : new Error(String(err));
+          if (pausedDueToCredits) {
+            modelUsed = 'google/gemini-4-hydrogen';
+          } else {
+            lastError = err instanceof Error ? err : new Error(String(err));
+          }
         }
       }
 
       clearInterval(keepAlive);
 
-      if (clientAbort.signal.aborted) {
+      if (clientAbort.signal.aborted && !pausedDueToCredits) {
         res.end();
+        return;
+      }
+
+      if (pausedDueToCredits) {
+        const partialHtml = finalizePartialPreviewHtml(fullRaw);
+        const codeStart = findCodeStart(fullRaw);
+        const partialProse = codeStart
+          ? sanitizeBuildProse(fullRaw.slice(0, codeStart.markerIdx))
+          : sanitizeBuildProse(fullRaw);
+        const partialFiles = partialHtml
+          ? extractLiveBuildArtifacts(partialHtml).map((a) => a.path)
+          : emittedFiles;
+        const partialDbTables = mergeParsedDbTables(
+          emittedDbTables,
+          extractDbSchemaFromRaw(fullRaw),
+          extractDbSchemaFromHtml(partialHtml)
+        );
+        if (partialDbTables.length > 0) {
+          sendEvent({ type: 'schema', tables: partialDbTables });
+        }
+
+        const creditsToConsume =
+          effectiveCreditBudget !== null
+            ? Math.max(0, effectiveCreditBudget)
+            : buildCreditsEmitted;
+        let updatedBilling = initialBillingSummary;
+        if (creditsToConsume > 0 && generationCreditContext) {
+          updatedBilling =
+            (await commitGenerationCredits(
+              generationCreditContext,
+              creditsToConsume
+            ).catch(() => null)) ?? initialBillingSummary;
+        }
+        const exhaustInfo = generationCreditContext
+          ? getCreditExhaustionInfo({
+              ...generationCreditContext.state,
+              monthlyCreditsRemaining: Math.max(
+                0,
+                updatedBilling?.monthlyCreditsRemaining ??
+                  generationCreditContext.state.monthlyCreditsRemaining - creditsToConsume
+              ),
+              dailyCreditsUsed:
+                updatedBilling?.dailyCreditsUsed ??
+                generationCreditContext.state.dailyCreditsUsed + creditsToConsume,
+            })
+          : {
+              code: 'MONTHLY_LIMIT_REACHED' as const,
+              error:
+                'Your remaining credits reached 0 during building. Building is paused with all progress saved until credits reset or you upgrade.',
+            };
+
+        const finalInfo = resolveModelInfo(modelUsed || requestedModel || 'openrouter/auto');
+        sendEvent({
+          type: 'paused',
+          reason: exhaustInfo.code,
+          message: exhaustInfo.error,
+          kind: 'build',
+          fullText:
+            partialProse ||
+            'Build progress was automatically saved right when your remaining tokens ran out.',
+          previewHtml: partialHtml,
+          allFiles: partialFiles,
+          dbTables: partialDbTables,
+          bytesBuilt: partialHtml.length,
+          creditsUsed: creditsToConsume,
+          billing: updatedBilling,
+          modelUsed: finalInfo.id,
+          modelName: finalInfo.name,
+          provider: finalInfo.provider,
+          startedAt: job.startedAt,
+        });
         return;
       }
 
@@ -3583,10 +3824,14 @@ async function startServer() {
         }
       }
 
-      const finalCreditsUsed =
+      const rawCreditsUsed =
         resolvedKind === 'build' && (previewHtml.length > 0 || finalFiles.length > 0)
           ? Math.max(1, calculateBuildCreditsForBytes(previewHtml.length))
           : 0;
+      const finalCreditsUsed =
+        effectiveCreditBudget !== null
+          ? Math.min(rawCreditsUsed, effectiveCreditBudget)
+          : rawCreditsUsed;
 
       let updatedBilling = initialBillingSummary;
       if (finalCreditsUsed > 0 && generationCreditContext) {

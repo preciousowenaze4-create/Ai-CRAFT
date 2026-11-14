@@ -575,7 +575,7 @@ export async function upgradeUserAccountFromTransaction(params: {
 }
 
 export const BYTES_PER_BUILD_CREDIT = 1350;
-export const MAX_CREDITS_PER_BUILD = 20;
+export const MAX_CREDITS_PER_BUILD = 35;
 
 export function calculateBuildCreditsForBytes(bytesBuilt: number): number {
   if (!Number.isFinite(bytesBuilt) || bytesBuilt <= 0) return 0;
@@ -583,6 +583,43 @@ export function calculateBuildCreditsForBytes(bytesBuilt: number): number {
     MAX_CREDITS_PER_BUILD,
     Math.max(1, Math.floor(bytesBuilt / BYTES_PER_BUILD_CREDIT) + 1)
   );
+}
+
+export function getAvailableCreditsBudget(
+  input: BillingAccountState,
+  nowMs = Date.now()
+): number {
+  const { state } = normalizeBillingState(input, nowMs);
+  const plan = getPlanConfig(state.tier);
+  const dailyHeadroom =
+    plan.dailyLimit !== null
+      ? Math.max(0, plan.dailyLimit - state.dailyCreditsUsed)
+      : Number.MAX_SAFE_INTEGER;
+  return Math.max(0, Math.min(state.monthlyCreditsRemaining, dailyHeadroom));
+}
+
+export function getCreditExhaustionInfo(
+  input: BillingAccountState,
+  nowMs = Date.now()
+): {
+  code: 'DAILY_LIMIT_REACHED' | 'MONTHLY_LIMIT_REACHED';
+  error: string;
+} {
+  const { state } = normalizeBillingState(input, nowMs);
+  const plan = getPlanConfig(state.tier);
+  if (state.monthlyCreditsRemaining <= 0) {
+    return {
+      code: 'MONTHLY_LIMIT_REACHED',
+      error:
+        state.tier === 'free'
+          ? 'Your 300 free credits for this 30-day cycle have finished. Building is paused until your monthly refresh or plan upgrade.'
+          : `All ${plan.monthlyCredits.toLocaleString()} credits for this 30-day cycle on ${plan.name} are used up. Building is paused until your cycle resets or you upgrade.`,
+    };
+  }
+  return {
+    code: 'DAILY_LIMIT_REACHED',
+    error: `Daily limit reached (${(plan.dailyLimit ?? 0).toLocaleString()} credits/day on ${plan.name}). Building is paused until your 24-hour reset or plan upgrade.`,
+  };
 }
 
 export interface VerifiedGenerationContext {
@@ -599,6 +636,7 @@ export async function verifyUserCanGenerate(
       allowed: true;
       context: VerifiedGenerationContext | null;
       billing: BillingSummaryPayload | null;
+      creditBudget: number | null;
     }
   | {
       allowed: false;
@@ -610,12 +648,12 @@ export async function verifyUserCanGenerate(
 > {
   const { accessToken, refreshToken } = extractAuthTokensFromRequest(request);
   if (!accessToken && !refreshToken) {
-    return { allowed: true, context: null, billing: null };
+    return { allowed: true, context: null, billing: null, creditBudget: null };
   }
 
   const auth = await getAuthenticatedSupabaseUser(accessToken, refreshToken);
   if (!auth.user) {
-    return { allowed: true, context: null, billing: null };
+    return { allowed: true, context: null, billing: null, creditBudget: null };
   }
 
   const current = await reconcileAndLoadBillingState({
@@ -645,6 +683,7 @@ export async function verifyUserCanGenerate(
       state: current,
     },
     billing: serializeBillingSummary(current),
+    creditBudget: getAvailableCreditsBudget(current, Date.now()),
   };
 }
 

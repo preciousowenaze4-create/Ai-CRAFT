@@ -39,6 +39,7 @@ import {
   WorkspaceView,
 } from '../types/craft';
 import { ProcessedAttachment, readAttachmentFile } from '../utils/attachment';
+import { buildProjectSecretHints } from '../utils/secretHints';
 import { FloatingLogoMenu } from './FloatingLogoMenu';
 import { LivingBotanicalWallpaper } from './LivingBotanicalWallpaper';
 import { ModelSelectorPopover } from './ModelSelectorPopover';
@@ -90,11 +91,27 @@ function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
     .trim();
 }
 
+function formatCountdown(isoDate: string | undefined, nowMs: number): string {
+  if (!isoDate) return '';
+  const targetMs = Date.parse(isoDate);
+  if (Number.isNaN(targetMs)) return '';
+  const diffSec = Math.max(0, Math.floor((targetMs - nowMs) / 1000));
+  if (diffSec <= 0) return '0s';
+  const days = Math.floor(diffSec / 86400);
+  const hours = Math.floor((diffSec % 86400) / 3600);
+  const mins = Math.floor((diffSec % 3600) / 60);
+  const secs = diffSec % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${String(mins).padStart(2, '0')}m ${String(secs).padStart(2, '0')}s`;
+  return `${mins}m ${String(secs).padStart(2, '0')}s`;
+}
+
 interface BuilderWorkspaceProps {
   projectId: string;
   projectTitle: string;
   mode: BuildMode;
   credits: number;
+  billing: BillingSummary | null;
   turns: BuilderTurn[];
   isStreaming: boolean;
   activeView: WorkspaceView;
@@ -117,6 +134,7 @@ interface BuilderWorkspaceProps {
   onDeployProject: (slug: string) => void;
   onBack: () => void;
   onSendFollowUp: (message: string, options: ComposerOptions) => void;
+  onContinueTurn: (turn: BuilderTurn) => void;
   onCheckCanUseAi?: () => boolean;
   onPaymentRequired?: (billing?: BillingSummary | null, errorMessage?: string) => void;
   onOpenApps: () => void;
@@ -130,6 +148,7 @@ export function BuilderWorkspace({
   projectTitle,
   mode,
   credits,
+  billing,
   turns,
   isStreaming,
   activeView,
@@ -152,6 +171,7 @@ export function BuilderWorkspace({
   onDeployProject,
   onBack,
   onSendFollowUp,
+  onContinueTurn,
   onCheckCanUseAi,
   onPaymentRequired,
   onOpenApps,
@@ -181,15 +201,35 @@ export function BuilderWorkspace({
     () => turns.some((t) => t.phase === 'understanding' || t.phase === 'building'),
     [turns]
   );
+  const hasPausedTurn = useMemo(
+    () => turns.some((t) => t.phase === 'paused'),
+    [turns]
+  );
 
   useEffect(() => {
-    if (!hasWorkingTurn) return;
+    if (!hasWorkingTurn && !hasPausedTurn) return;
     setNowMs(Date.now());
     const id = window.setInterval(() => {
       setNowMs(Date.now());
     }, 1000);
     return () => window.clearInterval(id);
-  }, [hasWorkingTurn]);
+  }, [hasWorkingTurn, hasPausedTurn]);
+
+  const monthlyExhausted =
+    credits <= 0 || (billing !== null && billing.monthlyCreditsRemaining <= 0);
+  const dailyExhausted =
+    billing?.dailyLimit !== null &&
+    billing?.dailyLimit !== undefined &&
+    billing.dailyCreditsUsed >= billing.dailyLimit;
+  const resetTimePassed =
+    (monthlyExhausted &&
+      Boolean(billing?.monthlyResetAt) &&
+      Date.parse(billing!.monthlyResetAt) <= nowMs) ||
+    (dailyExhausted &&
+      Boolean(billing?.dailyResetAt) &&
+      Date.parse(billing!.dailyResetAt) <= nowMs);
+  const canResumeCreditsNow =
+    (!monthlyExhausted && !dailyExhausted) || resetTimePassed;
 
   const {
     status: voiceStatus,
@@ -316,11 +356,55 @@ export function BuilderWorkspace({
   window.ENV = Object.assign({}, window.ENV || {}, envMap);
   window.process = window.process || {};
   window.process.env = Object.assign({}, window.process.env || {}, envMap);
+  function getSecretFn(key) {
+    if (!key) return undefined;
+    if (Object.prototype.hasOwnProperty.call(envMap, key)) return envMap[key];
+    var lower = String(key).toLowerCase();
+    var allKeys = Object.keys(envMap);
+    for (var i = 0; i < allKeys.length; i += 1) {
+      if (allKeys[i].toLowerCase() === lower) return envMap[allKeys[i]];
+    }
+    return undefined;
+  }
+  function findSecretFn() {
+    var patterns = Array.prototype.slice.call(arguments).filter(Boolean);
+    var allKeys = Object.keys(envMap);
+    for (var p = 0; p < patterns.length; p += 1) {
+      var exact = getSecretFn(String(patterns[p]));
+      if (exact) return exact;
+    }
+    for (var p2 = 0; p2 < patterns.length; p2 += 1) {
+      var pat = String(patterns[p2]).toLowerCase();
+      var re = null;
+      try { re = new RegExp(pat, 'i'); } catch (e) {}
+      for (var i = 0; i < allKeys.length; i += 1) {
+        var k = allKeys[i];
+        var v = String(envMap[k] || '');
+        if (!v) continue;
+        if (k.toLowerCase().indexOf(pat) !== -1 || (re && re.test(k))) {
+          if (pat.indexOf('url') !== -1 && v.indexOf('http') !== 0 && !re) continue;
+          return v;
+        }
+      }
+    }
+    for (var p3 = 0; p3 < patterns.length; p3 += 1) {
+      var hintPat = String(patterns[p3]).toLowerCase();
+      for (var j = 0; j < allKeys.length; j += 1) {
+        var v2 = String(envMap[allKeys[j]] || '');
+        if (!v2) continue;
+        if (hintPat.indexOf('supabase') !== -1 && hintPat.indexOf('url') !== -1 && /^https:\\/\\/[a-z0-9-]+\\.supabase\\.co/i.test(v2)) return v2;
+        if (hintPat.indexOf('supabase') !== -1 && hintPat.indexOf('url') === -1 && (/^eyJ[a-zA-Z0-9_-]+\\./.test(v2) || /^sb_(?:publishable|secret)_/i.test(v2))) return v2;
+        if (hintPat.indexOf('google') !== -1 && /\\.apps\\.googleusercontent\\.com$/i.test(v2)) return v2;
+      }
+    }
+    return undefined;
+  }
   if (window.AICraft) {
     window.AICraft.env = envMap;
-    window.AICraft.getSecret = function(key) {
-      return Object.prototype.hasOwnProperty.call(envMap, key) ? envMap[key] : undefined;
-    };
+    window.AICraft.secretKeys = Object.keys(envMap);
+    window.AICraft.getSecret = getSecretFn;
+    window.AICraft.hasSecret = function(key) { return Boolean(getSecretFn(key)); };
+    window.AICraft.findSecret = findSecretFn;
     return;
   }
   function cleanTable(table) {
@@ -435,9 +519,10 @@ export function BuilderWorkspace({
   }
   window.AICraft = {
     env: envMap,
-    getSecret: function(key) {
-      return Object.prototype.hasOwnProperty.call(envMap, key) ? envMap[key] : undefined;
-    },
+    secretKeys: Object.keys(envMap),
+    getSecret: getSecretFn,
+    hasSecret: function(key) { return Boolean(getSecretFn(key)); },
+    findSecret: findSecretFn,
     db: dbApi,
     ask: ask,
     chat: ask,
@@ -488,9 +573,11 @@ export function BuilderWorkspace({
           webSearchEnabled,
           attachmentName: null,
           secretKeys: secrets.map((s) => s.key),
+          secretHints: buildProjectSecretHints(secrets),
           databaseTables: databaseConfigRef.current.tables.map(
             (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
           ),
+          clientCreditsRemaining: credits,
         });
         return;
       }
@@ -702,9 +789,11 @@ export function BuilderWorkspace({
                 webSearchEnabled,
                 forceChat: true,
                 secretKeys: secrets.map((s) => s.key),
+                secretHints: buildProjectSecretHints(secrets),
                 databaseTables: databaseConfigRef.current.tables.map(
                   (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
                 ),
+                clientCreditsRemaining: credits,
               },
             }),
           });
@@ -784,6 +873,7 @@ export function BuilderWorkspace({
     return () => window.removeEventListener('message', handleBridgeMessage);
   }, [
     authHeaders,
+    credits,
     mode,
     onCheckCanUseAi,
     onPaymentRequired,
@@ -876,11 +966,13 @@ export function BuilderWorkspace({
     attachmentMimeType: overrides?.attachmentMimeType ?? null,
     attachmentText: overrides?.attachmentText ?? null,
     secretKeys: secrets.map((s) => s.key),
+    secretHints: buildProjectSecretHints(secrets),
     databaseTables: databaseConfig.enabled
       ? databaseConfig.tables.map(
           (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
         )
       : [],
+    clientCreditsRemaining: credits,
   });
 
   const handleSubmit = () => {
@@ -1153,6 +1245,7 @@ export function BuilderWorkspace({
                 turn.phase === 'understanding' || turn.phase === 'building';
               const displayAiText = sanitizeDisplayProse(turn.aiText, isBuildTurn);
 
+              const isPausedTurn = turn.phase === 'paused';
               const stepUnderstandingDone = turn.phase !== 'understanding';
               const stepBuildingDone = turn.phase === 'complete';
 
@@ -1240,7 +1333,9 @@ export function BuilderWorkspace({
                               ? Math.max(1, Math.floor((nowMs - turn.startedAt) / 1000))
                               : Math.max(1, turn.thoughtSeconds)
                           }s)`
-                        : `Thought for ${Math.max(1, turn.thoughtSeconds)}s`}
+                        : isPausedTurn
+                          ? `Paused at ${Math.max(1, turn.thoughtSeconds)}s`
+                          : `Thought for ${Math.max(1, turn.thoughtSeconds)}s`}
                     </span>
                   </div>
 
@@ -1294,6 +1389,7 @@ export function BuilderWorkspace({
                   {/* Real-Time Build Checklist & Progress Bar (Shown once building starts) */}
                   {isBuildTurn &&
                     (turn.phase === 'building' ||
+                      turn.phase === 'paused' ||
                       turn.phase === 'complete' ||
                       turn.files.length > 0) && (() => {
                     const bytes = turn.bytesBuilt ?? turn.previewHtml?.length ?? 0;
@@ -1319,6 +1415,8 @@ export function BuilderWorkspace({
                                 className="w-4 h-4 animate-spin shrink-0"
                                 style={{ color: theme.accentColor }}
                               />
+                            ) : isPausedTurn ? (
+                              <AlertCircle className="w-4 h-4 text-[#6D4AFF] shrink-0" />
                             ) : (
                               <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                             )}
@@ -1326,7 +1424,9 @@ export function BuilderWorkspace({
                               {turn.files.length > 0
                                 ? turn.phase === 'complete'
                                   ? `Built ${turn.files.length} ${turn.files.length === 1 ? 'part' : 'parts'}`
-                                  : `${turn.activeAction} ${formatBuildStepLabel(turn.activeFile)}`
+                                  : isPausedTurn
+                                    ? `Saved ${turn.files.length} ${turn.files.length === 1 ? 'part' : 'parts'} (paused)`
+                                    : `${turn.activeAction} ${formatBuildStepLabel(turn.activeFile)}`
                                 : turn.phaseLabel}
                             </span>
                             {turn.activeFile && isTurnWorking ? (
@@ -1496,6 +1596,7 @@ export function BuilderWorkspace({
 
                   {/* Inline Build Status Card (Shown once building starts) */}
                   {isBuildTurn &&
+                    !isPausedTurn &&
                     (turn.phase === 'building' ||
                       turn.phase === 'complete' ||
                       turn.phase === 'error' ||
@@ -1599,6 +1700,97 @@ export function BuilderWorkspace({
                       </div>
                     </div>
                   )}
+
+                  {/* Paused Build Card — Stops at 0 Credits & Unlocks "Continue" Automatically on Reset/Top-Up */}
+                  {isPausedTurn && (() => {
+                    const resetCountdown = monthlyExhausted
+                      ? formatCountdown(billing?.monthlyResetAt, nowMs)
+                      : dailyExhausted
+                        ? formatCountdown(billing?.dailyResetAt, nowMs)
+                        : '';
+                    const savedBytes = turn.bytesBuilt ?? turn.previewHtml?.length ?? 0;
+                    const savedLabel =
+                      savedBytes >= 1024
+                        ? `${(savedBytes / 1024).toFixed(1)} KB saved`
+                        : savedBytes > 0
+                          ? `${savedBytes} B saved`
+                          : '';
+
+                    return (
+                      <div className="rounded-2xl border border-black/[0.08] bg-white p-4 shadow-[0_2px_10px_rgba(15,15,30,0.03)] flex flex-col gap-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <h3 className="font-display font-bold text-[15px] text-[#0B0B0F] tracking-[-0.01em]">
+                              {canResumeCreditsNow
+                                ? 'Credits ready · Resume build'
+                                : 'Build paused · 0 tokens remaining'}
+                            </h3>
+                            <p className="mt-1 text-[13.5px] leading-relaxed text-[#52525B]">
+                              {canResumeCreditsNow
+                                ? 'Your tokens are available again. Tap Continue Building to finish from your saved progress.'
+                                : turn.pausedMessage ||
+                                  'All remaining tokens were used and your progress is saved. Building resumes automatically once tokens reset or you upgrade.'}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-[12px] text-[#71717A] tabular-nums">
+                          {canResumeCreditsNow ? (
+                            <span className="font-medium text-[#6D4AFF]">
+                              {credits.toLocaleString()} credits available
+                            </span>
+                          ) : resetCountdown ? (
+                            <span>
+                              {monthlyExhausted
+                                ? `Monthly refresh in ${resetCountdown}`
+                                : `Daily reset in ${resetCountdown}`}
+                            </span>
+                          ) : (
+                            <span>Waiting for credit reset or upgrade</span>
+                          )}
+                          {savedLabel && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span>{savedLabel}</span>
+                            </>
+                          )}
+                          {Boolean(turn.previewHtml) && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <button
+                                type="button"
+                                onClick={() => onSetView('preview')}
+                                className="font-medium text-[#0B0B0F] underline underline-offset-4 hover:opacity-75"
+                              >
+                                Preview saved progress
+                              </button>
+                            </>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2 pt-0.5">
+                          {canResumeCreditsNow ? (
+                            <button
+                              type="button"
+                              disabled={isStreaming}
+                              onClick={() => onContinueTurn(turn)}
+                              className="flex-1 min-h-[44px] px-4 rounded-xl bg-[#6D4AFF] hover:bg-[#5B38F5] active:scale-[0.99] text-white text-[14px] font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              Continue Building
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={onOpenUpgrade}
+                              className="flex-1 min-h-[44px] px-4 rounded-xl bg-[#0B0B0F] hover:bg-black/85 active:scale-[0.99] text-white text-[14px] font-semibold transition-all"
+                            >
+                              Upgrade Plan to Continue
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {/* Post-Build One-Tap Follow-Up Suggestions (Auto-Send on Tap) */}
                   {turn.phase === 'complete' &&

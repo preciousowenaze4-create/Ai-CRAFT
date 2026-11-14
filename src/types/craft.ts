@@ -4,7 +4,12 @@ export type NavTab = 'apps' | 'create' | 'setting';
 
 export type WorkspaceView = 'chat' | 'preview' | 'code';
 
-export type BuildPhase = 'understanding' | 'building' | 'complete' | 'error';
+export type BuildPhase =
+  | 'understanding'
+  | 'building'
+  | 'paused'
+  | 'complete'
+  | 'error';
 
 export type TurnKind = 'chat' | 'build';
 
@@ -66,6 +71,11 @@ export interface ProjectSecret {
   updatedAt: string;
 }
 
+export interface ProjectSecretHint {
+  key: string;
+  hint: string;
+}
+
 export interface ProjectDatabaseColumn {
   name: string;
   type: 'text' | 'number' | 'boolean' | 'timestamp' | 'json';
@@ -104,7 +114,9 @@ export interface ComposerOptions {
   attachmentMimeType?: string | null;
   attachmentText?: string | null;
   secretKeys?: string[];
+  secretHints?: ProjectSecretHint[];
   databaseTables?: string[];
+  clientCreditsRemaining?: number;
 }
 
 export interface BuilderTurn {
@@ -129,6 +141,14 @@ export interface BuilderTurn {
   modelProvider?: string;
   previewHtml?: string;
   bytesBuilt?: number;
+  creditsUsed?: number;
+  pausedReason?:
+    | 'DAILY_LIMIT_REACHED'
+    | 'MONTHLY_LIMIT_REACHED'
+    | 'CREDITS_EXHAUSTED'
+    | 'STREAM_INTERRUPTED';
+  pausedMessage?: string;
+  pausedAt?: string;
   errorMessage?: string;
 }
 

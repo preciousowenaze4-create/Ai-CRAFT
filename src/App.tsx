@@ -23,6 +23,7 @@ import {
 import { PromptComposer } from './components/PromptComposer';
 import { TopBar } from './components/TopBar';
 import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
+import { buildProjectSecretHints } from './utils/secretHints';
 import {
   AuthUser,
   BillingSummary,
@@ -325,7 +326,7 @@ function mergeProjectsFromCloud(
 }
 
 const CLIENT_BYTES_PER_BUILD_CREDIT = 1350;
-const CLIENT_MAX_CREDITS_PER_BUILD = 20;
+const CLIENT_MAX_CREDITS_PER_BUILD = 35;
 
 function calculateClientBuildCredits(bytesBuilt: number): number {
   if (!Number.isFinite(bytesBuilt) || bytesBuilt <= 0) return 0;
@@ -404,6 +405,8 @@ export default function App() {
   const retriedTurnsRef = useRef<Set<string>>(new Set());
   const projectsRef = useRef<CraftProject[]>(projects);
   projectsRef.current = projects;
+  const creditsRef = useRef<number>(credits);
+  creditsRef.current = credits;
 
   const persistTimerRef = useRef<number | null>(null);
   const cloudSyncTimerRef = useRef<number | null>(null);
@@ -446,6 +449,58 @@ export default function App() {
       // ignore network error
     }
   }, [applyBillingSummary]);
+
+  // Automatically sync billing when daily or monthly reset time arrives so paused builds unlock seamlessly
+  const hasAnyPausedTurn = projects.some((p) => p.turns.some((t) => t.phase === 'paused'));
+  useEffect(() => {
+    if (!authUser) return;
+    const isDailyExhausted =
+      billing?.dailyLimit !== null &&
+      billing?.dailyLimit !== undefined &&
+      billing.dailyCreditsUsed >= billing.dailyLimit;
+    const needsResetWatch = credits <= 0 || isDailyExhausted || hasAnyPausedTurn;
+    if (!needsResetWatch) return;
+
+    const nowMs = Date.now();
+    const candidateTimes = [billing?.dailyResetAt, billing?.monthlyResetAt]
+      .filter((v): v is string => Boolean(v))
+      .map((v) => Date.parse(v))
+      .filter((ts) => Number.isFinite(ts));
+
+    if (candidateTimes.some((ts) => ts <= nowMs)) {
+      void syncBillingFromServer();
+    }
+
+    const futureTimes = candidateTimes.filter((ts) => ts > nowMs);
+    let timeoutId: number | null = null;
+    if (futureTimes.length > 0) {
+      const nextResetMs = Math.min(...futureTimes);
+      const delayMs = Math.min(Math.max(1000, nextResetMs - nowMs + 1200), 2_147_483_647);
+      timeoutId = window.setTimeout(() => {
+        void syncBillingFromServer();
+      }, delayMs);
+    }
+
+    const intervalId = hasAnyPausedTurn
+      ? window.setInterval(() => {
+          void syncBillingFromServer();
+        }, 60_000)
+      : null;
+
+    return () => {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      if (intervalId !== null) window.clearInterval(intervalId);
+    };
+  }, [
+    authUser,
+    billing?.dailyCreditsUsed,
+    billing?.dailyLimit,
+    billing?.dailyResetAt,
+    billing?.monthlyResetAt,
+    credits,
+    hasAnyPausedTurn,
+    syncBillingFromServer,
+  ]);
 
   const theme = MODE_THEMES[mode];
   const energyLevel = dynamicColorEnabled
@@ -896,7 +951,8 @@ export default function App() {
       // Smooth, realistic token metering: 0 credits for chat/thinking, ~1 credit / ~950ms during active builds
       let turnChargedSoFar = 0;
       let targetCreditsForTurn = 0;
-      let currentTurnPhase: 'understanding' | 'building' | 'complete' | 'error' = 'understanding';
+      let currentTurnPhase: 'understanding' | 'building' | 'complete' | 'paused' | 'error' =
+        'understanding';
       let currentTurnKind: TurnKind = 'chat';
       let latestBytesBuilt = 0;
       let creditTickTimer: number | null = null;
@@ -967,13 +1023,13 @@ export default function App() {
                 type: string;
                 jobId?: string;
                 startedAt?: number;
-                status?: 'running' | 'complete' | 'error';
+                status?: 'running' | 'paused' | 'complete' | 'error';
                 kind?: TurnKind;
                 modelId?: string;
                 modelUsed?: string;
                 modelName?: string;
                 provider?: string;
-                phase?: 'understanding' | 'building' | 'complete' | 'error';
+                phase?: 'understanding' | 'building' | 'complete' | 'paused' | 'error';
                 label?: string;
                 phaseLabel?: string;
                 action?: string;
@@ -998,6 +1054,10 @@ export default function App() {
                 previewHtml?: string;
                 message?: string;
                 errorMessage?: string;
+                reason?: BuilderTurn['pausedReason'];
+                pausedReason?: BuilderTurn['pausedReason'];
+                pausedMessage?: string;
+                pausedAt?: string;
                 thoughtSeconds?: number;
               };
 
@@ -1233,6 +1293,10 @@ export default function App() {
                       typeof evt.bytesBuilt === 'number'
                         ? evt.bytesBuilt
                         : t.bytesBuilt,
+                    creditsUsed:
+                      typeof evt.creditsUsed === 'number'
+                        ? evt.creditsUsed
+                        : t.creditsUsed,
                     modelId: evt.modelUsed ?? t.modelId,
                     modelName: evt.modelName ?? t.modelName,
                     modelProvider: evt.provider ?? t.modelProvider,
@@ -1305,6 +1369,122 @@ export default function App() {
                     // ignore notification error in unsupported contexts
                   }
                 }
+              } else if (evt.type === 'paused') {
+                sawTerminalEvent = true;
+                stopCreditTicker();
+                flushBuffered();
+                const pauseSeconds = Math.max(
+                  1,
+                  Math.round(
+                    (Date.now() - (typeof evt.startedAt === 'number' ? evt.startedAt : startedAt)) /
+                      1000
+                  )
+                );
+                const resolvedReason: BuilderTurn['pausedReason'] =
+                  evt.reason ?? evt.pausedReason ?? 'CREDITS_EXHAUSTED';
+                const resolvedPauseMessage =
+                  evt.message ??
+                  evt.pausedMessage ??
+                  'Credits ran out during this build. Your progress is saved — continue once your balance resets or you upgrade.';
+                updateTurn(projectId, turnId, (t) => {
+                  const resolvedFiles = evt.allFiles ?? evt.files ?? t.files;
+                  return {
+                    ...t,
+                    kind: 'build',
+                    phase: 'paused',
+                    phaseLabel: evt.phaseLabel ?? 'Paused · 0 tokens left',
+                    thoughtSeconds:
+                      typeof evt.thoughtSeconds === 'number'
+                        ? evt.thoughtSeconds
+                        : pauseSeconds,
+                    aiText:
+                      typeof evt.fullText === 'string' && evt.fullText.trim()
+                        ? evt.fullText
+                        : typeof evt.aiText === 'string' && evt.aiText.trim()
+                          ? evt.aiText
+                          : t.aiText,
+                    previewHtml: evt.previewHtml || t.previewHtml,
+                    files: resolvedFiles,
+                    activeAction: resolvedFiles.length > 0 ? 'Saved' : 'Paused',
+                    activeFile: resolvedFiles[0] ?? t.activeFile,
+                    bytesBuilt:
+                      typeof evt.bytesBuilt === 'number'
+                        ? evt.bytesBuilt
+                        : t.bytesBuilt,
+                    creditsUsed:
+                      typeof evt.creditsUsed === 'number'
+                        ? evt.creditsUsed
+                        : turnChargedSoFar || t.creditsUsed,
+                    modelId: evt.modelUsed ?? evt.modelId ?? t.modelId,
+                    modelName: evt.modelName ?? t.modelName,
+                    modelProvider: evt.provider ?? t.modelProvider,
+                    pausedReason: resolvedReason,
+                    pausedMessage: resolvedPauseMessage,
+                    pausedAt: evt.pausedAt ?? new Date().toISOString(),
+                  };
+                });
+                if (Array.isArray(evt.dbTables) && evt.dbTables.length > 0) {
+                  const pausedTables = evt.dbTables;
+                  setProjects((prev) =>
+                    prev.map((p) =>
+                      p.id === projectId
+                        ? {
+                            ...p,
+                            databaseConfig: mergeIncomingDbSchema(
+                              p.databaseConfig,
+                              pausedTables
+                            ),
+                          }
+                        : p
+                    )
+                  );
+                  window.dispatchEvent(
+                    new CustomEvent('aicraft:db-updated', { detail: { projectId } })
+                  );
+                }
+                if (evt.billing) {
+                  applyBillingSummary(evt.billing);
+                } else {
+                  if (resolvedReason === 'DAILY_LIMIT_REACHED') {
+                    setBilling((prev) => {
+                      if (!prev || prev.dailyLimit === null) return prev;
+                      const updated: BillingSummary = {
+                        ...prev,
+                        dailyCreditsUsed: prev.dailyLimit,
+                      };
+                      try {
+                        window.localStorage.setItem(
+                          STORAGE_BILLING_KEY,
+                          JSON.stringify(updated)
+                        );
+                      } catch {
+                        // ignore storage error
+                      }
+                      return updated;
+                    });
+                  } else {
+                    setCredits(0);
+                    setBilling((prev) => {
+                      if (!prev) return prev;
+                      const updated: BillingSummary = {
+                        ...prev,
+                        monthlyCreditsRemaining: 0,
+                      };
+                      try {
+                        window.localStorage.setItem(
+                          STORAGE_BILLING_KEY,
+                          JSON.stringify(updated)
+                        );
+                        window.localStorage.setItem(STORAGE_CREDITS_KEY, '0');
+                      } catch {
+                        // ignore storage error
+                      }
+                      return updated;
+                    });
+                  }
+                  void syncBillingFromServer();
+                }
+                setInlineNotice(resolvedPauseMessage);
               } else if (evt.type === 'error') {
                 sawTerminalEvent = true;
                 stopCreditTicker();
@@ -1424,7 +1604,7 @@ export default function App() {
             void resumeJobStreamRef.current?.(projectId, turnId, reconnectJobId);
           } else if (!reconnectJobId) {
             updateTurn(projectId, turnId, (t) =>
-              t.phase === 'complete' || t.phase === 'error'
+              t.phase === 'complete' || t.phase === 'paused' || t.phase === 'error'
                 ? t
                 : {
                     ...t,
@@ -1471,7 +1651,7 @@ export default function App() {
       const project = projectsRef.current.find((p) => p.id === projectId);
       const turn = project?.turns.find((t) => t.id === turnId);
       if (!project || !turn) return;
-      if (turn.phase === 'complete' || turn.phase === 'error') return;
+      if (turn.phase === 'complete' || turn.phase === 'paused' || turn.phase === 'error') return;
 
       const targetJobId = jobId || turn.jobId;
       if (!targetJobId) {
@@ -1485,6 +1665,7 @@ export default function App() {
           ]);
           const previousHtml =
             [...priorTurns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+          const projectSecrets = project.secrets ?? [];
           void runBuilderStream(
             project.id,
             turn.id,
@@ -1498,10 +1679,12 @@ export default function App() {
               webSearchEnabled: true,
               attachmentName: turn.attachmentName,
               attachmentDataUrl: turn.attachmentDataUrl ?? null,
-              secretKeys: (project.secrets ?? []).map((s) => s.key),
+              secretKeys: projectSecrets.map((s) => s.key),
+              secretHints: buildProjectSecretHints(projectSecrets),
               databaseTables: (project.databaseConfig?.tables ?? []).map(
                 (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
               ),
+              clientCreditsRemaining: creditsRef.current,
             },
             previousHtml,
             turn.startedAt ?? Date.now()
@@ -1532,6 +1715,7 @@ export default function App() {
             ]);
             const previousHtml =
               [...priorTurns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+            const projectSecrets = project.secrets ?? [];
             void runBuilderStream(
               project.id,
               turn.id,
@@ -1545,10 +1729,12 @@ export default function App() {
                 webSearchEnabled: true,
                 attachmentName: turn.attachmentName,
                 attachmentDataUrl: turn.attachmentDataUrl ?? null,
-                secretKeys: (project.secrets ?? []).map((s) => s.key),
+                secretKeys: projectSecrets.map((s) => s.key),
+                secretHints: buildProjectSecretHints(projectSecrets),
                 databaseTables: (project.databaseConfig?.tables ?? []).map(
                   (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
                 ),
+                clientCreditsRemaining: creditsRef.current,
               },
               previousHtml,
               turn.startedAt ?? Date.now()
@@ -1609,8 +1795,8 @@ export default function App() {
                 );
                 if (!res.ok) return;
                 const snap = (await res.json()) as {
-                  status?: 'running' | 'complete' | 'error';
-                  phase?: 'understanding' | 'building' | 'complete' | 'error';
+                  status?: 'running' | 'paused' | 'complete' | 'error';
+                  phase?: 'understanding' | 'building' | 'complete' | 'paused' | 'error';
                   phaseLabel?: string;
                   kind?: TurnKind;
                   aiText?: string;
@@ -1621,13 +1807,20 @@ export default function App() {
                   activeAction?: string;
                   activeFile?: string;
                   bytesBuilt?: number;
+                  creditsUsed?: number;
                   thoughtSeconds?: number;
                   modelId?: string;
                   modelName?: string;
                   provider?: string;
                   errorMessage?: string;
+                  pausedReason?: BuilderTurn['pausedReason'];
+                  pausedMessage?: string;
                 };
-                if (snap.status === 'complete' || snap.status === 'error') {
+                if (
+                  snap.status === 'complete' ||
+                  snap.status === 'paused' ||
+                  snap.status === 'error'
+                ) {
                   activeConnectionsRef.current.get(turn.id)?.abort();
                   activeConnectionsRef.current.delete(turn.id);
                   updateTurn(proj.id, turn.id, (t) => ({
@@ -1657,11 +1850,24 @@ export default function App() {
                       typeof snap.bytesBuilt === 'number'
                         ? snap.bytesBuilt
                         : t.bytesBuilt,
+                    creditsUsed:
+                      typeof snap.creditsUsed === 'number'
+                        ? snap.creditsUsed
+                        : t.creditsUsed,
                     modelId: snap.modelId ?? t.modelId,
                     modelName: snap.modelName ?? t.modelName,
                     modelProvider: snap.provider ?? t.modelProvider,
                     errorMessage: snap.errorMessage ?? t.errorMessage,
+                    pausedReason: snap.pausedReason ?? t.pausedReason,
+                    pausedMessage: snap.pausedMessage ?? t.pausedMessage,
+                    pausedAt:
+                      snap.status === 'paused'
+                        ? t.pausedAt ?? new Date().toISOString()
+                        : t.pausedAt,
                   }));
+                  if (snap.status === 'paused') {
+                    void syncBillingFromServer();
+                  }
                 }
               } catch {
                 // ignore background check failure
@@ -1717,9 +1923,15 @@ export default function App() {
   };
 
   const checkCanConsumeCredit = useCallback((): boolean => {
+    const nowMs = Date.now();
+    const monthlyResetMs = billing?.monthlyResetAt ? Date.parse(billing.monthlyResetAt) : NaN;
+    const dailyResetMs = billing?.dailyResetAt ? Date.parse(billing.dailyResetAt) : NaN;
+    const monthlyResetPassed = Number.isFinite(monthlyResetMs) && nowMs >= monthlyResetMs;
+    const dailyResetPassed = Number.isFinite(dailyResetMs) && nowMs >= dailyResetMs;
+
     if (
-      credits <= 0 ||
-      (billing !== null && billing.monthlyCreditsRemaining <= 0)
+      (credits <= 0 || (billing !== null && billing.monthlyCreditsRemaining <= 0)) &&
+      !monthlyResetPassed
     ) {
       setInlineNotice(
         proPlanId
@@ -1731,6 +1943,7 @@ export default function App() {
     }
 
     if (
+      !dailyResetPassed &&
       billing?.dailyLimit !== null &&
       billing?.dailyLimit !== undefined &&
       billing.dailyCreditsUsed >= billing.dailyLimit
@@ -1742,8 +1955,12 @@ export default function App() {
       return false;
     }
 
+    if (monthlyResetPassed || dailyResetPassed) {
+      void syncBillingFromServer();
+    }
+
     return true;
-  }, [billing, credits, proPlanId]);
+  }, [billing, credits, proPlanId, syncBillingFromServer]);
 
   // Immediately transforms to BuilderWorkspace when a message is sent from the first screen
   // without ever interrupting or stopping any other project currently building
@@ -1807,7 +2024,10 @@ export default function App() {
       mode,
       chosenModelId,
       [],
-      options,
+      {
+        ...options,
+        clientCreditsRemaining: credits,
+      },
       '',
       now
     );
@@ -1854,6 +2074,14 @@ export default function App() {
         .reverse()
         .find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
 
+    const projectSecrets = activeProject.secrets ?? [];
+    const enrichedOptions: ComposerOptions = {
+      ...options,
+      secretKeys: options.secretKeys ?? projectSecrets.map((s) => s.key),
+      secretHints: options.secretHints ?? buildProjectSecretHints(projectSecrets),
+      clientCreditsRemaining: options.clientCreditsRemaining ?? credits,
+    };
+
     setProjects((prev) =>
       prev.map((p) =>
         p.id === activeProject.id ? { ...p, turns: [...p.turns, newTurn] } : p
@@ -1867,7 +2095,88 @@ export default function App() {
       activeProject.mode,
       chosenModelId,
       history,
-      options,
+      enrichedOptions,
+      previousHtml,
+      now
+    );
+  };
+
+  const handleContinueTurn = (pausedTurn: BuilderTurn) => {
+    if (!activeProject || isProjectWorking(activeProject)) return;
+    if (!checkCanConsumeCredit()) return;
+
+    unlockSpeechSynthesis();
+
+    const now = Date.now();
+    const turnId = `turn-${now}-${Math.random().toString(36).slice(2, 6)}`;
+    const currentModel = models.find((m) => m.id === selectedModel);
+    const chosenModelId =
+      currentModel?.id || pausedTurn.modelId || selectedModel || undefined;
+
+    const previousHtml =
+      pausedTurn.previewHtml ||
+      [...activeProject.turns]
+        .reverse()
+        .find((t) => Boolean(t.previewHtml))?.previewHtml ||
+      '';
+
+    const newTurn: BuilderTurn = {
+      id: turnId,
+      startedAt: now,
+      kind: 'build',
+      userMessage: 'Continue building from saved progress',
+      attachmentName: null,
+      attachmentDataUrl: null,
+      phase: 'understanding',
+      phaseLabel: 'Resuming build...',
+      thoughtSeconds: 1,
+      activeAction: 'Resuming',
+      activeFile: '',
+      files: [],
+      bytesBuilt: 0,
+      aiText: '',
+      modelId: chosenModelId,
+      modelName: currentModel?.name ?? pausedTurn.modelName,
+      modelProvider: currentModel?.provider ?? pausedTurn.modelProvider,
+    };
+
+    const history = activeProject.turns.flatMap((t) => [
+      { role: 'user', text: t.userMessage },
+      ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
+    ]);
+
+    const projectSecrets = activeProject.secrets ?? [];
+    const continuationOptions: ComposerOptions = {
+      reactEnabled: activeProject.mode === 'web',
+      backendEnabled: false,
+      webSearchEnabled: true,
+      attachmentName: null,
+      attachmentDataUrl: null,
+      secretKeys: projectSecrets.map((s) => s.key),
+      secretHints: buildProjectSecretHints(projectSecrets),
+      databaseTables: (activeProject.databaseConfig?.tables ?? []).map(
+        (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
+      ),
+      clientCreditsRemaining: credits,
+    };
+
+    const continuePrompt = `[[CONTINUE_BUILD]] Resume and finish building the app seamlessly from the existing saved preview HTML for: "${pausedTurn.userMessage}". Preserve every completed section, feature, database call, and secret integration already in the saved HTML, and finish any incomplete or missing sections so the complete app is polished and production-ready.`;
+
+    setProjects((prev) =>
+      prev.map((p) =>
+        p.id === activeProject.id ? { ...p, turns: [...p.turns, newTurn] } : p
+      )
+    );
+    setInlineNotice(null);
+
+    void runBuilderStream(
+      activeProject.id,
+      turnId,
+      continuePrompt,
+      activeProject.mode,
+      chosenModelId,
+      history,
+      continuationOptions,
       previousHtml,
       now
     );
@@ -2216,6 +2525,7 @@ export default function App() {
             projectTitle={activeProject.title}
             mode={activeProject.mode}
             credits={credits}
+            billing={billing}
             turns={activeProject.turns}
             isStreaming={activeProjectIsStreaming}
             activeView={activeWorkspaceView}
@@ -2318,6 +2628,7 @@ export default function App() {
               }
             }}
             onSendFollowUp={handleFollowUp}
+            onContinueTurn={handleContinueTurn}
             onCheckCanUseAi={checkCanConsumeCredit}
             onPaymentRequired={(nextBilling, errMsg) => {
               if (nextBilling) applyBillingSummary(nextBilling);
@@ -2509,6 +2820,10 @@ export default function App() {
                                         ? 'Building'
                                         : 'Thinking'}
                                     </span>
+                                  </span>
+                                ) : latestTurn?.phase === 'paused' ? (
+                                  <span className="px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[11px] font-medium">
+                                    Paused
                                   </span>
                                 ) : hasAppBuilt ? (
                                   <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-medium">

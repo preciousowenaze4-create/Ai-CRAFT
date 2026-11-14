@@ -2,6 +2,7 @@ import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import {
   calculateBuildCreditsForBytes,
   commitGenerationCredits,
+  getCreditExhaustionInfo,
   verifyUserCanGenerate,
 } from '../_billing.js';
 
@@ -694,6 +695,39 @@ ${rawHtml}
   return assembleHtmlFromScatteredBlocks(raw);
 }
 
+function finalizePartialPreviewHtml(raw: string): string {
+  let html = extractPreviewHtmlFromRaw(raw);
+  if (!html) return '';
+
+  // Trim any trailing truncated tag fragment (e.g. "<div cla")
+  const lastOpenBracket = html.lastIndexOf('<');
+  const lastCloseBracket = html.lastIndexOf('>');
+  if (lastOpenBracket > lastCloseBracket && lastOpenBracket > 0) {
+    html = html.slice(0, lastOpenBracket).trimEnd();
+  }
+
+  // Close open <script> or <style> cleanly if cut mid-block
+  const lastScriptOpen = html.toLowerCase().lastIndexOf('<script');
+  const lastScriptClose = html.toLowerCase().lastIndexOf('</script>');
+  if (lastScriptOpen > lastScriptClose) {
+    const lastNewline = html.lastIndexOf('\n');
+    if (lastNewline > lastScriptOpen) {
+      html = html.slice(0, lastNewline);
+    }
+    html += '\n</script>';
+  }
+
+  const lastStyleOpen = html.toLowerCase().lastIndexOf('<style');
+  const lastStyleClose = html.toLowerCase().lastIndexOf('</style>');
+  if (lastStyleOpen > lastStyleClose) {
+    html += '\n</style>';
+  }
+
+  if (!/<\/body>/i.test(html)) html += '\n</body>';
+  if (!/<\/html>/i.test(html)) html += '\n</html>';
+  return html;
+}
+
 function extractPreviewStructureSummary(previousHtml: string): string {
   if (!previousHtml.trim()) return '';
   const items = extractLiveBuildArtifacts(previousHtml).map((a) => `${a.action} ${a.path}`);
@@ -1168,7 +1202,9 @@ export async function POST(request: Request): Promise<Response> {
       attachmentMimeType?: string | null;
       attachmentText?: string | null;
       secretKeys?: string[];
+      secretHints?: Array<{ key?: string; hint?: string }>;
       databaseTables?: string[];
+      clientCreditsRemaining?: number;
     };
   };
 
@@ -1207,12 +1243,29 @@ export async function POST(request: Request): Promise<Response> {
         .map((k) => k.trim())
         .slice(0, 30)
     : [];
+  const secretHints = Array.isArray(options.secretHints)
+    ? options.secretHints
+        .filter(
+          (item): item is { key: string; hint: string } =>
+            Boolean(item && typeof item.key === 'string' && item.key.trim().length > 0)
+        )
+        .map((item) => ({
+          key: item.key.trim(),
+          hint: typeof item.hint === 'string' && item.hint.trim() ? item.hint.trim() : 'configured-secret',
+        }))
+        .slice(0, 30)
+    : secretKeys.map((key) => ({ key, hint: 'configured-secret' }));
   const databaseTables = Array.isArray(options.databaseTables)
     ? options.databaseTables
         .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
         .map((t) => t.trim())
         .slice(0, 20)
     : [];
+  const clientCreditsHint =
+    typeof options.clientCreditsRemaining === 'number' &&
+    Number.isFinite(options.clientCreditsRemaining)
+      ? Math.max(0, Math.floor(options.clientCreditsRemaining))
+      : null;
 
   if (!message) {
     return Response.json({ error: 'Prompt message is required.' }, { status: 400 });
@@ -1229,6 +1282,8 @@ export async function POST(request: Request): Promise<Response> {
       { status: creditCheck.status }
     );
   }
+  const effectiveCreditBudget =
+    creditCheck.creditBudget !== null ? creditCheck.creditBudget : clientCreditsHint;
 
   const encoder = new TextEncoder();
 
@@ -1328,16 +1383,23 @@ export async function POST(request: Request): Promise<Response> {
           activeFlags.push(`Existing project database tables: ${databaseTables.join('; ')}`);
         }
 
+        const effectiveKeysSummary =
+          secretHints.length > 0
+            ? secretHints.map((s) => `${s.key} (${s.hint})`).join(', ')
+            : secretKeys.join(', ');
+
         const projectInfraContext = [
-          'PROJECT SECRETS & REAL-TIME DATABASE INFRASTRUCTURE:',
-          secretKeys.length > 0
-            ? `- Saved project Secret keys available at runtime in this app: ${secretKeys.join(', ')}.`
-            : '- No project Secret keys saved yet. Users can add API keys/tokens anytime via the "Secrets" button in the bottom composer toolbar (+ Add secret -> Apply changes).',
-          '- Where project Secrets live at runtime: In generated apps, read any secret safely via `window.AICraft?.getSecret("KEY_NAME") || window.ENV?.KEY_NAME || window.__AICRAFT_ENV__?.KEY_NAME || (typeof process !== "undefined" && process.env ? process.env.KEY_NAME : "") || ""`. Never hardcode secret values.',
+          'PROJECT SECRETS & REAL-TIME DATABASE INFRASTRUCTURE (CRITICAL — READ CAREFULLY):',
+          secretHints.length > 0
+            ? `- Saved project Secrets configured in this project right now (values are securely injected at runtime in Preview — NEVER ask the user to paste keys into chat): ${effectiveKeysSummary}.`
+            : '- No project Secret keys saved yet. Users add any API key/token anytime via the "Secrets" button in the bottom composer toolbar (+ Add secret -> Apply changes).',
+          '- RUNTIME SECRETS DISCOVERY: In generated HTML apps, read secrets using `window.AICraft.getSecret("EXACT_KEY")` OR smart pattern lookup `window.AICraft.findSecret("pattern1", "pattern2", ...)` (which searches both custom key names AND credential types, e.g. `findSecret("SUPABASE_URL", "supabase_url", "supabase")` finds user-named keys like `MY_SUPABASE` or `SUPABASE`). All secrets are also available on `window.AICraft.env`, `window.ENV`, `window.__AICRAFT_ENV__`, and `process.env`.',
+          '- RULE WHEN USER SAYS KEYS ARE IN SECRETS: Whenever the user says they pasted a key into Secrets (e.g., "I already pasted my Supabase in the secret", "I added Google key", etc.), immediately inspect the configured Secret keys & detected types above. Locate the matching key name(s) accurately, wire them directly into the generated app code using both `getSecret("EXACT_KEY")` and `findSecret(...)` fallback, and explicitly confirm which exact key name(s) you connected. If a companion key is still missing (for example Supabase Project URL is present without the Anon/Publishable key), clearly tell the user which exact missing key name to add in the Secrets drawer.',
           databaseTables.length > 0
             ? `- Existing structured project Database tables: ${databaseTables.join('; ')}.`
-            : '- The project Database drawer automatically captures and structures tables in real time as the app is built and used — users never manually input Supabase keys or table forms.',
-          '- Real-time Database API: Generated apps persist data with `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, `await window.AICraft.db.remove("table", id)`.',
+            : '- The project Database drawer automatically captures and structures real-time tables as the app is built and used — users never manually enter Supabase URLs or table forms inside Database.',
+          '- REAL SUPABASE + GOOGLE LOGIN + REAL DATABASE WIRING: When Supabase secrets (`supabase-project-url` and `supabase-anon-key`/`jwt-token`/`supabase-credential`) are configured in Secrets OR requested by the user (e.g. WhatsApp/chat app with Google Login & real DB): load `@supabase/supabase-js@2` via `<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>`, initialize `window.supabase.createClient(sbUrl, sbKey)` using the exact key names found in Secrets (`getSecret` + `findSecret` fallback), wire real `supabaseClient.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })` + `onAuthStateChange` + real `supabaseClient.from(table).select/insert/update/delete`, AND sync records into `window.AICraft.db` (`list`, `insert`, `update`, `remove`) while emitting `[[DB_SCHEMA: ...]]` lines so BOTH real cloud Postgres AND AI Craft Database explorer reflect real live data.',
+          '- BUILT-IN REAL-TIME DATABASE API: For every app with data persistence, persist records via `await window.AICraft.db.list("table")`, `await window.AICraft.db.insert("table", row)`, `await window.AICraft.db.update("table", id, patch)`, `await window.AICraft.db.remove("table", id)`.',
         ].join('\n');
 
         const previewSummary = extractPreviewStructureSummary(previousHtml);
@@ -1348,19 +1410,19 @@ export async function POST(request: Request): Promise<Response> {
           'STEP 0 (Architectural Planning & Structured Database Lines): Output 4 short planning lines using exact format `[[PLAN: <step>]]` covering:',
           '  1) `[[PLAN: Color palette & typography — ...]]` (choose a refined, harmonious color palette, high-contrast surfaces, crisp font hierarchy)',
           '  2) `[[PLAN: Layout & button placement — ...]]` (plan clean visual structure, thumb-friendly 44px+ buttons, intuitive header & bottom nav placement, balanced spacing)',
-          '  3) `[[PLAN: Real-time features & live media — ...]]` (plan real clocks/timers, `window.AICraft.db` persistence, live `window.AICraft.search(query)` / `window.AICraft.ask(prompt)`, and verified search images or crisp inline SVGs)',
+          '  3) `[[PLAN: Real-time features, secrets & database — ...]]` (plan real clocks/timers, real Secrets integration if needed, `window.AICraft.db` / Supabase persistence, live `window.AICraft.search(query)` / `window.AICraft.ask(prompt)`, and verified search images or crisp inline SVGs)',
           '  4) `[[PLAN: Monetization & growth flow — ...]]` (plan built-in interactive monetization tailored to the app: Pro/Premium plan sheet, monthly/annual toggle, credits/checkout drawer, creator tips, or revenue metrics)',
-          'STEP 0B (Automatic Real-Time Database Schema Lines): Whenever the app you are building stores or manages data (e.g. a TikTok-style app -> `profiles`, `videos`, `comments`, `likes`; a store -> `products`, `orders`; a tracker -> `entries`), IMMEDIATELY output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Example: `[[DB_SCHEMA: profiles(id:text, username:text, bio:text, followers_count:number, created_at:timestamp)]]`.',
-          'PART 1 (Architectural Overview & Feedback): Write 2–3 calm, clear plain-text sentences summarizing the structure, color choices, button layout, real-time database/features, and monetization you built, plus brief feedback on how it can grow next. If the app integrates an external API key or uses project secrets, mention the exact key name stored in Secrets. ABSOLUTELY PROHIBITED IN PART 1: NEVER include raw code, HTML tags, CSS, JS, markdown code fences (```), backticks, or the words "PART 1" / "PART 2" / "PART 3", and NEVER tell the user to copy/paste code.',
+          'STEP 0B (Automatic Real-Time Database Schema Lines): Whenever the app you are building stores or manages data (e.g. WhatsApp -> `users`, `chats`, `messages`; TikTok -> `profiles`, `videos`, `comments`, `likes`; store -> `products`, `orders`), IMMEDIATELY output one `[[DB_SCHEMA: table_name(col1:type, col2:type, ...)]]` line per table right after your PLAN lines (allowed column types: `text`, `number`, `boolean`, `timestamp`, `json`). Example: `[[DB_SCHEMA: messages(id:text, chat_id:text, sender_id:text, body:text, created_at:timestamp)]]`.',
+          'PART 1 (Architectural Overview & Feedback): Write 2–3 calm, clear plain-text sentences summarizing the structure, color choices, button layout, real-time database/features, connected Secrets keys (if any), and monetization you built, plus brief feedback on how it can grow next. ABSOLUTELY PROHIBITED IN PART 1: NEVER include raw code, HTML tags, CSS, JS, markdown code fences (```), backticks, or the words "PART 1" / "PART 2" / "PART 3", and NEVER tell the user to copy/paste code.',
           'PART 2 (Full-Screen Real-Time App): On a new line immediately output the exact marker <<<AICRAFT_APP_HTML>>> followed by a complete, thoughtfully crafted, self-contained, runnable <!DOCTYPE html> application ending with <<<END_AICRAFT_APP_HTML>>>.',
           'Rules for the HTML app in PART 2:',
           `- Design it as a refined ${targetLabel} experience inside AI Craft's full-screen Preview tab.`,
           '- COHESIVE COLOR & ERGONOMIC BUTTONS: Craft a polished color system (clean surface hierarchy, tasteful accent, accessible contrast), smooth transitions, and well-placed >= 44px touch-target buttons (clear primary CTA, uncluttered header, intuitive navigation).',
-          '- REAL-TIME STRUCTURED DATABASE & PERSISTENCE: Persist all app data via `window.AICraft.db` (`list`, `insert`, `update`, `remove`). On first load, if `await window.AICraft.db.list(table)` is empty, seed 2–4 realistic starter rows via `window.AICraft.db.insert(...)` so the app and live Database drawer work immediately.',
-          '- PROJECT SECRETS ACCESS: When calling any external API or using configured keys, always read `const apiKey = window.AICraft?.getSecret?.("KEY_NAME") || window.ENV?.KEY_NAME || process?.env?.KEY_NAME || "";` cleanly with graceful UI handling if a key has not been added to Secrets yet.',
+          '- REAL-TIME STRUCTURED DATABASE & PERSISTENCE: Persist all app data via `window.AICraft.db` (`list`, `insert`, `update`, `remove`) — and when Supabase secrets exist, connect real `@supabase/supabase-js@2` queries + auth synced seamlessly with `window.AICraft.db`. On first load, if `await window.AICraft.db.list(table)` is empty, seed 2–4 realistic starter rows via `window.AICraft.db.insert(...)` so the app and live Database drawer work immediately.',
+          '- PROJECT SECRETS ACCESS & REAL INTEGRATIONS: Never hardcode API keys. Always resolve secrets via `window.AICraft?.getSecret?.("EXACT_KEY") || window.AICraft?.findSecret?.("alias1", "alias2") || window.ENV?.EXACT_KEY || ""`. Handle missing keys cleanly in-app by showing which key name to paste in the AI Craft Secrets drawer.',
           '- BUILD & MONETIZE IN REAL TIME: Every app must include working interactive flows, real-time clock/date or live timers, plus a genuine interactive monetization feature tailored naturally to the app (such as a working Pro/Premium upgrade modal with monthly/annual switch, interactive checkout/wallet flow, creator tip jar, featured/sponsored tier, or live revenue/MRR widget).',
           '- GOOGLE/WEB SEARCH & REAL IMAGES: Use `await window.AICraft.search(query)` (automatically injected in Preview—returns `{ query, results, images }` with real snippets and `imageUrl`) and `await window.AICraft.ask(prompt)` for live AI responses/content. If you embed verified `https://` image URLs from the search grounding above, always include a clean `onerror` fallback so broken icons never appear; otherwise use crisp inline SVGs and CSS gradients.',
-          '- SURGICAL SCREENSHOT & PREVIEW EDITING: When updating an existing Preview app or inspecting an attached screenshot, identify precisely what the user wants removed/cut vs. kept, remove ONLY what was requested, preserve everything else cleanly, and output the complete updated <!DOCTYPE html> app.',
+          '- SURGICAL EDITING & CONTINUE RESUME: When updating an existing Preview app, inspecting an attached screenshot, OR resuming a paused build (`[[CONTINUE_BUILD]]`), inspect `previousHtml` carefully, preserve all working progress & data, complete any unfinished sections/logic cleanly, and output the complete runnable <!DOCTYPE html> app.',
           '- Organize multi-screen apps (like Feed, Discover, Pricing/Pro, Checkout, Profile, Settings, Dashboard) using semantic `<section id="...">`, `<nav>`, `<header>` tags.',
           '- Full-screen layout (`min-height: 100dvh; width: 100%; margin: 0;`) unless the user specifically asks for a compact widget.',
           'PART 3 (Next Suggested Upgrades): Immediately AFTER <<<END_AICRAFT_APP_HTML>>>, output:',
@@ -1384,8 +1446,8 @@ export async function POST(request: Request): Promise<Response> {
               : '',
             'Respond directly and conversationally in real time to the user message.',
             'The user is chatting or asking a question right now — reply naturally without rebuilding the app or outputting HTML code.',
-            'If asked about project Secrets or API keys, clearly reference the configured key names above and explain they live in the Secrets button inside the composer toolbar (`window.AICraft.getSecret("KEY")`, `window.ENV`, `process.env`).',
-            'If asked about the Database, explain the structured tables built for this app in the Database button inside the composer toolbar (`window.AICraft.db`).',
+            'If asked about project Secrets or API keys, inspect the configured Secret keys & detected types above, name the exact key(s) you see (e.g. SUPABASE_URL / MY_SUPABASE), and confirm whether everything needed is present or which exact key should be added in the Secrets button.',
+            'If asked about the Database, explain the structured tables built for this app in the Database button inside the composer toolbar (`window.AICraft.db` and connected Supabase Postgres when configured).',
             'NEVER tell the user to copy and paste code. If they later ask you to build or change the app, you will build it into Preview.',
             'If the user asks for the current time, date, or day, use the real-time clock context above accurately.',
             'Keep formatting clean and readable.',
@@ -1484,6 +1546,26 @@ export async function POST(request: Request): Promise<Response> {
         let creditsCommitted = false;
         let modelUsed = '';
         let noticedReasoning = false;
+        let pausedDueToCredits = false;
+        const generationAbort = new AbortController();
+        const forwardRequestAbort = () => {
+          if (!generationAbort.signal.aborted) {
+            generationAbort.abort();
+          }
+        };
+        if (request.signal.aborted) {
+          forwardRequestAbort();
+        } else {
+          request.signal.addEventListener('abort', forwardRequestAbort, { once: true });
+        }
+
+        const triggerCreditPause = () => {
+          if (pausedDueToCredits) return;
+          pausedDueToCredits = true;
+          if (!generationAbort.signal.aborted) {
+            generationAbort.abort();
+          }
+        };
 
         const resetStreamParser = () => {
           if (
@@ -1551,6 +1633,10 @@ export async function POST(request: Request): Promise<Response> {
 
         const promoteToBuildPhase = () => {
           resolvedKind = 'build';
+          if (effectiveCreditBudget !== null && effectiveCreditBudget <= 0) {
+            triggerCreditPause();
+            return;
+          }
           if (!emittedBuildPhase) {
             emittedBuildPhase = true;
             sendEvent({
@@ -1591,8 +1677,13 @@ export async function POST(request: Request): Promise<Response> {
           }
 
           const targetCredits = calculateBuildCreditsForBytes(cleanHtml.length);
+          const cappedTargetCredits =
+            effectiveCreditBudget !== null
+              ? Math.min(targetCredits, effectiveCreditBudget)
+              : targetCredits;
+
           if (
-            targetCredits > buildCreditsEmitted &&
+            cappedTargetCredits > buildCreditsEmitted &&
             (buildCreditsEmitted === 0 || nowMs - lastCreditEmitAt >= 900)
           ) {
             buildCreditsEmitted += 1;
@@ -1600,8 +1691,23 @@ export async function POST(request: Request): Promise<Response> {
             sendEvent({
               type: 'credits',
               used: buildCreditsEmitted,
-              targetUsed: targetCredits,
+              targetUsed: cappedTargetCredits,
             });
+          }
+
+          // Strict hard stop: if build consumption exceeds remaining credit budget, pause right here
+          if (
+            effectiveCreditBudget !== null &&
+            (targetCredits > effectiveCreditBudget ||
+              (effectiveCreditBudget > 0 && buildCreditsEmitted >= effectiveCreditBudget && cleanHtml.length > effectiveCreditBudget * 1350))
+          ) {
+            buildCreditsEmitted = effectiveCreditBudget;
+            sendEvent({
+              type: 'credits',
+              used: effectiveCreditBudget,
+              targetUsed: effectiveCreditBudget,
+            });
+            triggerCreditPause();
           }
         };
 
@@ -1781,7 +1887,7 @@ export async function POST(request: Request): Promise<Response> {
 
           for (let i = 0; i < candidates.length; i += 1) {
             const candidateId = candidates[i];
-            if (request.signal.aborted) break;
+            if (request.signal.aborted || pausedDueToCredits) break;
 
             const modelInfo = resolveModelInfo(candidateId, catalog);
 
@@ -1826,10 +1932,15 @@ export async function POST(request: Request): Promise<Response> {
                     });
                   }
                 },
-                request.signal
+                generationAbort.signal
               );
 
               flushPendingStreamBuffer();
+
+              if (pausedDueToCredits) {
+                modelUsed = candidateId;
+                break;
+              }
 
               if (!fullRaw.trim()) {
                 throw new Error(`Model ${candidateId} returned an empty response.`);
@@ -1848,6 +1959,10 @@ export async function POST(request: Request): Promise<Response> {
               succeeded = true;
               break;
             } catch (err) {
+              if (pausedDueToCredits) {
+                modelUsed = candidateId;
+                break;
+              }
               if (request.signal.aborted) break;
               const errMsg = err instanceof Error ? err.message : String(err);
               const isGenuineInvalidKey =
@@ -1867,7 +1982,7 @@ export async function POST(request: Request): Promise<Response> {
           }
         }
 
-        if (!succeeded && geminiClient && !request.signal.aborted) {
+        if (!succeeded && !pausedDueToCredits && geminiClient && !request.signal.aborted) {
           try {
             if (openRouterKey) {
               resetStreamParser();
@@ -1968,30 +2083,114 @@ export async function POST(request: Request): Promise<Response> {
             }
 
             for await (const chunk of geminiStream) {
-              if (request.signal.aborted) break;
+              if (request.signal.aborted || pausedDueToCredits) break;
               if (chunk.text) {
                 handleTextChunk(chunk.text);
+                if (pausedDueToCredits) break;
               }
             }
 
             flushPendingStreamBuffer();
 
-            if (!fullRaw.trim()) {
-              throw new Error('Fallback AI engine returned an empty response.');
-            }
+            if (pausedDueToCredits) {
+              modelUsed = 'google/gemini-4-hydrogen';
+            } else {
+              if (!fullRaw.trim()) {
+                throw new Error('Fallback AI engine returned an empty response.');
+              }
 
-            modelUsed = 'google/gemini-4-hydrogen';
-            succeeded = true;
+              modelUsed = 'google/gemini-4-hydrogen';
+              succeeded = true;
+            }
           } catch (err) {
-            lastError = err instanceof Error ? err : new Error(String(err));
+            if (pausedDueToCredits) {
+              modelUsed = 'google/gemini-4-hydrogen';
+            } else {
+              lastError = err instanceof Error ? err : new Error(String(err));
+            }
           }
         }
 
-        if (request.signal.aborted) {
+        if (request.signal.aborted && !pausedDueToCredits) {
           if (!creditsCommitted && resolvedKind === 'build' && buildCreditsEmitted > 0) {
             creditsCommitted = true;
-            await commitGenerationCredits(creditCheck.context, buildCreditsEmitted).catch(() => null);
+            const toCommit =
+              effectiveCreditBudget !== null
+                ? Math.min(buildCreditsEmitted, effectiveCreditBudget)
+                : buildCreditsEmitted;
+            await commitGenerationCredits(creditCheck.context, toCommit).catch(() => null);
           }
+          closeStream();
+          return;
+        }
+
+        if (pausedDueToCredits) {
+          const partialHtml = finalizePartialPreviewHtml(fullRaw);
+          const codeStart = findCodeStart(fullRaw);
+          const partialProse = codeStart
+            ? sanitizeBuildProse(fullRaw.slice(0, codeStart.markerIdx))
+            : sanitizeBuildProse(fullRaw);
+          const partialFiles = partialHtml
+            ? extractLiveBuildArtifacts(partialHtml).map((a) => a.path)
+            : emittedFiles;
+          const partialDbTables = mergeParsedDbTables(
+            emittedDbTables,
+            extractDbSchemaFromRaw(fullRaw),
+            extractDbSchemaFromHtml(partialHtml)
+          );
+          if (partialDbTables.length > 0) {
+            sendEvent({ type: 'schema', tables: partialDbTables });
+          }
+
+          const creditsToConsume =
+            effectiveCreditBudget !== null
+              ? Math.max(0, effectiveCreditBudget)
+              : buildCreditsEmitted;
+          let updatedBilling = creditCheck.billing;
+          if (!creditsCommitted && creditsToConsume > 0) {
+            creditsCommitted = true;
+            updatedBilling =
+              (await commitGenerationCredits(creditCheck.context, creditsToConsume).catch(
+                () => null
+              )) ?? creditCheck.billing;
+          }
+          const exhaustInfo = creditCheck.context
+            ? getCreditExhaustionInfo({
+                ...creditCheck.context.state,
+                monthlyCreditsRemaining: Math.max(
+                  0,
+                  (updatedBilling?.monthlyCreditsRemaining ??
+                    creditCheck.context.state.monthlyCreditsRemaining - creditsToConsume)
+                ),
+                dailyCreditsUsed:
+                  updatedBilling?.dailyCreditsUsed ??
+                  creditCheck.context.state.dailyCreditsUsed + creditsToConsume,
+              })
+            : {
+                code: 'MONTHLY_LIMIT_REACHED' as const,
+                error:
+                  'Your remaining credits reached 0 during building. Building is paused with all progress saved until credits reset or you upgrade.',
+              };
+
+          const finalInfo = resolveModelInfo(modelUsed || requestedModel || 'openrouter/auto', catalog);
+          sendEvent({
+            type: 'paused',
+            reason: exhaustInfo.code,
+            message: exhaustInfo.error,
+            kind: 'build',
+            fullText:
+              partialProse ||
+              'Build progress was automatically saved right when your remaining tokens ran out.',
+            previewHtml: partialHtml,
+            allFiles: partialFiles,
+            dbTables: partialDbTables,
+            bytesBuilt: partialHtml.length,
+            creditsUsed: creditsToConsume,
+            billing: updatedBilling,
+            modelUsed: finalInfo.id,
+            modelName: finalInfo.name,
+            provider: finalInfo.provider,
+          });
           closeStream();
           return;
         }
@@ -2053,10 +2252,14 @@ export async function POST(request: Request): Promise<Response> {
           }
         }
 
-        const finalCreditsUsed =
+        const rawCreditsUsed =
           resolvedKind === 'build' && (previewHtml.length > 0 || finalFiles.length > 0)
             ? Math.max(1, calculateBuildCreditsForBytes(previewHtml.length))
             : 0;
+        const finalCreditsUsed =
+          effectiveCreditBudget !== null
+            ? Math.min(rawCreditsUsed, effectiveCreditBudget)
+            : rawCreditsUsed;
         let updatedBilling = creditCheck.billing;
         if (finalCreditsUsed > 0 && !creditsCommitted) {
           creditsCommitted = true;
