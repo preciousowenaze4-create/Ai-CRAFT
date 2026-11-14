@@ -33,6 +33,9 @@ import {
   NavTab,
   OpenRouterModel,
   PaymentTransaction,
+  ProjectDatabaseConfig,
+  ProjectDeploymentConfig,
+  ProjectSecret,
   TurnKind,
   UserProfile,
   WorkspaceView,
@@ -44,6 +47,9 @@ interface CraftProject {
   mode: BuildMode;
   createdAt: string;
   turns: BuilderTurn[];
+  secrets?: ProjectSecret[];
+  databaseConfig?: ProjectDatabaseConfig;
+  deployment?: ProjectDeploymentConfig;
 }
 
 interface CloudWorkspacePayload {
@@ -232,7 +238,17 @@ function mergeProjectsFromCloud(
     } else if (localItem.turns.length >= existing.turns.length) {
       const localWorking = isProjectWorking(localItem);
       const cloudComplete = existing.turns.some((t) => t.phase === 'complete');
-      mergedMap.set(localItem.id, localWorking && cloudComplete ? existing : localItem);
+      const base = localWorking && cloudComplete ? existing : localItem;
+      mergedMap.set(localItem.id, {
+        ...base,
+        secrets:
+          base.secrets && base.secrets.length > 0
+            ? base.secrets
+            : existing.secrets ?? localItem.secrets,
+        databaseConfig:
+          base.databaseConfig ?? existing.databaseConfig ?? localItem.databaseConfig,
+        deployment: base.deployment ?? existing.deployment ?? localItem.deployment,
+      });
     }
   }
   return Array.from(mergedMap.values());
@@ -2071,7 +2087,31 @@ export default function App() {
             turns={activeProject.turns}
             isStreaming={activeProjectIsStreaming}
             activeView={activeWorkspaceView}
-            isPublished={Boolean(publishedProjects[activeProject.id])}
+            isPublished={
+              Boolean(publishedProjects[activeProject.id]) ||
+              activeProject.deployment?.status === 'deployed'
+            }
+            secrets={activeProject.secrets ?? []}
+            databaseConfig={
+              activeProject.databaseConfig ?? {
+                enabled: true,
+                providerLabel: 'Cloud & Local App Store',
+                tables: [],
+              }
+            }
+            deployment={
+              activeProject.deployment ?? {
+                status: publishedProjects[activeProject.id] ? 'deployed' : 'draft',
+                slug:
+                  activeProject.title
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]+/g, '-')
+                    .replace(/^-+|-+$/g, '') || 'aicraft-app',
+                version: publishedProjects[activeProject.id] ? 1 : 0,
+                deployedAt: null,
+                environment: 'production',
+              }
+            }
             models={models}
             selectedModel={selectedModel}
             modelsLoading={modelsLoading}
@@ -2091,6 +2131,48 @@ export default function App() {
                 ...prev,
                 [activeProject.id]: true,
               }));
+            }}
+            onUpdateSecrets={(nextSecrets) => {
+              setProjects((prev) =>
+                prev.map((proj) =>
+                  proj.id === activeProject.id
+                    ? { ...proj, secrets: nextSecrets }
+                    : proj
+                )
+              );
+            }}
+            onUpdateDatabase={(nextDb) => {
+              setProjects((prev) =>
+                prev.map((proj) =>
+                  proj.id === activeProject.id
+                    ? { ...proj, databaseConfig: nextDb }
+                    : proj
+                )
+              );
+            }}
+            onDeployProject={(slug) => {
+              const nowIso = new Date().toISOString();
+              setPublishedProjects((prev) => ({
+                ...prev,
+                [activeProject.id]: true,
+              }));
+              setProjects((prev) =>
+                prev.map((proj) => {
+                  if (proj.id !== activeProject.id) return proj;
+                  const prevVersion = proj.deployment?.version ?? 0;
+                  return {
+                    ...proj,
+                    deployment: {
+                      status: 'deployed',
+                      slug,
+                      version: prevVersion + 1,
+                      deployedAt: nowIso,
+                      environment: 'production',
+                    },
+                  };
+                })
+              );
+              setInlineNotice(`${activeProject.title} deployed live`);
             }}
             onBack={() => {
               if (activeWorkspaceView !== 'chat') {

@@ -10,13 +10,16 @@ import {
   ChevronLeft,
   ChevronRight,
   Copy,
+  Database,
   Eye,
   Globe,
   HelpCircle,
+  KeyRound,
   Lightbulb,
   Loader2,
   MoreVertical,
   Paperclip,
+  Rocket,
   Volume2,
   X,
 } from 'lucide-react';
@@ -29,12 +32,20 @@ import {
   ComposerOptions,
   MODE_THEMES,
   OpenRouterModel,
+  ProjectDatabaseConfig,
+  ProjectDeploymentConfig,
+  ProjectSecret,
   WorkspaceView,
 } from '../types/craft';
 import { ProcessedAttachment, readAttachmentFile } from '../utils/attachment';
 import { FloatingLogoMenu } from './FloatingLogoMenu';
 import { LivingBotanicalWallpaper } from './LivingBotanicalWallpaper';
 import { ModelSelectorPopover } from './ModelSelectorPopover';
+import {
+  ProjectDatabaseModal,
+  ProjectDeployModal,
+  ProjectSecretsModal,
+} from './ProjectConfigDrawers';
 import { ProviderLogo } from './ProviderLogo';
 import { VoiceInputButton } from './VoiceInputButton';
 
@@ -86,6 +97,9 @@ interface BuilderWorkspaceProps {
   isStreaming: boolean;
   activeView: WorkspaceView;
   isPublished: boolean;
+  secrets: ProjectSecret[];
+  databaseConfig: ProjectDatabaseConfig;
+  deployment: ProjectDeploymentConfig;
   models: OpenRouterModel[];
   selectedModel: string;
   modelsLoading: boolean;
@@ -96,6 +110,9 @@ interface BuilderWorkspaceProps {
   onRetryModels: () => void;
   onSetView: (view: WorkspaceView) => void;
   onPublish: () => void;
+  onUpdateSecrets: (next: ProjectSecret[]) => void;
+  onUpdateDatabase: (next: ProjectDatabaseConfig) => void;
+  onDeployProject: (slug: string) => void;
   onBack: () => void;
   onSendFollowUp: (message: string, options: ComposerOptions) => void;
   onCheckCanUseAi?: () => boolean;
@@ -115,6 +132,9 @@ export function BuilderWorkspace({
   isStreaming,
   activeView,
   isPublished,
+  secrets,
+  databaseConfig,
+  deployment,
   models,
   selectedModel,
   modelsLoading,
@@ -125,6 +145,9 @@ export function BuilderWorkspace({
   onRetryModels,
   onSetView,
   onPublish,
+  onUpdateSecrets,
+  onUpdateDatabase,
+  onDeployProject,
   onBack,
   onSendFollowUp,
   onCheckCanUseAi,
@@ -142,6 +165,7 @@ export function BuilderWorkspace({
   const [followUp, setFollowUp] = useState('');
   const [attachment, setAttachment] = useState<ProcessedAttachment | null>(null);
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
+  const [activeDrawer, setActiveDrawer] = useState<'secrets' | 'database' | 'deploy' | null>(null);
   const [collapsedTurnIds, setCollapsedTurnIds] = useState<Record<string, boolean>>({});
   const [showHeaderActions, setShowHeaderActions] = useState(false);
   const [autoAllow, setAutoAllow] = useState(true);
@@ -189,6 +213,7 @@ export function BuilderWorkspace({
     stopVoice();
     setFollowUp('');
     setAttachment(null);
+    setActiveDrawer(null);
     setShowHeaderActions(false);
     setShowScrollBottom(false);
     setActiveCodeTab('index.html');
@@ -241,12 +266,84 @@ export function BuilderWorkspace({
     return parts;
   }, [latestPreviewHtml]);
 
-  // Inject window.AICraft bridge so built apps inside Preview can call the selected AI live
+  const secretsFingerprint = useMemo(
+    () => secrets.map((s) => `${s.key}:${s.updatedAt}`).join('|'),
+    [secrets]
+  );
+
+  // Inject window.AICraft bridge, per-project secrets, and scoped database runtime into Preview
   const connectedPreviewHtml = useMemo(() => {
     if (!latestPreviewHtml) return '';
+    const envMap: Record<string, string> = {};
+    for (const s of secrets) {
+      if (s.key) envMap[s.key] = s.value;
+    }
+    const safeEnvJson = JSON.stringify(envMap).replace(/</g, '\\u003c');
+    const safeDbPrefix = JSON.stringify(`aicraft_db_${projectId}_`).replace(/</g, '\\u003c');
+    const safeDbMeta = JSON.stringify({
+      enabled: databaseConfig.enabled,
+      apiUrl: databaseConfig.apiUrl || '',
+      tables: databaseConfig.tables.map((t) => t.name),
+    }).replace(/</g, '\\u003c');
+
     const bridgeScript = `<script>
 (function(){
-  if (window.AICraft) return;
+  var envMap = ${safeEnvJson};
+  var dbPrefix = ${safeDbPrefix};
+  var dbMeta = ${safeDbMeta};
+  window.__AICRAFT_ENV__ = envMap;
+  window.ENV = Object.assign({}, window.ENV || {}, envMap);
+  window.process = window.process || {};
+  window.process.env = Object.assign({}, window.process.env || {}, envMap);
+  if (window.AICraft) {
+    window.AICraft.env = envMap;
+    window.AICraft.getSecret = function(key) {
+      return Object.prototype.hasOwnProperty.call(envMap, key) ? envMap[key] : undefined;
+    };
+    return;
+  }
+  function readTable(table) {
+    try {
+      var raw = window.localStorage.getItem(dbPrefix + String(table || 'items'));
+      var parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) { return []; }
+  }
+  function writeTable(table, rows) {
+    try {
+      window.localStorage.setItem(dbPrefix + String(table || 'items'), JSON.stringify(rows));
+    } catch (e) {}
+    return rows;
+  }
+  var dbApi = {
+    meta: dbMeta,
+    list: function(table) { return Promise.resolve(readTable(table)); },
+    insert: function(table, row) {
+      var rows = readTable(table);
+      var item = Object.assign({ id: 'rec_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), created_at: new Date().toISOString() }, row || {});
+      rows.unshift(item);
+      writeTable(table, rows);
+      return Promise.resolve(item);
+    },
+    update: function(table, id, patch) {
+      var updated = null;
+      var rows = readTable(table).map(function(r) {
+        if (r && r.id === id) { updated = Object.assign({}, r, patch || {}); return updated; }
+        return r;
+      });
+      writeTable(table, rows);
+      return Promise.resolve(updated);
+    },
+    remove: function(table, id) {
+      var rows = readTable(table).filter(function(r) { return !r || r.id !== id; });
+      writeTable(table, rows);
+      return Promise.resolve(true);
+    },
+    clear: function(table) {
+      writeTable(table, []);
+      return Promise.resolve(true);
+    }
+  };
   var pending = {};
   window.addEventListener('message', function(e) {
     var d = e.data;
@@ -273,6 +370,11 @@ export function BuilderWorkspace({
     });
   }
   window.AICraft = {
+    env: envMap,
+    getSecret: function(key) {
+      return Object.prototype.hasOwnProperty.call(envMap, key) ? envMap[key] : undefined;
+    },
+    db: dbApi,
     ask: ask,
     chat: ask,
     search: search,
@@ -286,7 +388,7 @@ export function BuilderWorkspace({
       return latestPreviewHtml.replace(/<\/head>/i, `${bridgeScript}</head>`);
     }
     return `${bridgeScript}${latestPreviewHtml}`;
-  }, [latestPreviewHtml]);
+  }, [latestPreviewHtml, secrets, projectId, databaseConfig]);
 
   const activeModel = useMemo(
     () => models.find((m) => m.id === selectedModel) ?? null,
@@ -542,6 +644,22 @@ export function BuilderWorkspace({
     setAttachment(processed);
   };
 
+  const buildFollowUpOptions = (overrides?: Partial<ComposerOptions>): ComposerOptions => ({
+    reactEnabled: mode === 'web',
+    backendEnabled: databaseConfig.enabled && databaseConfig.tables.length > 0,
+    webSearchEnabled,
+    attachmentName: overrides?.attachmentName ?? null,
+    attachmentDataUrl: overrides?.attachmentDataUrl ?? null,
+    attachmentMimeType: overrides?.attachmentMimeType ?? null,
+    attachmentText: overrides?.attachmentText ?? null,
+    secretKeys: secrets.map((s) => s.key),
+    databaseTables: databaseConfig.enabled
+      ? databaseConfig.tables.map(
+          (t) => `${t.name}(${t.columns.map((c) => `${c.name}:${c.type}`).join(',')})`
+        )
+      : [],
+  });
+
   const handleSubmit = () => {
     if (!hasContent || isStreaming) return;
     stopVoice();
@@ -550,15 +668,15 @@ export function BuilderWorkspace({
       (attachment?.dataUrl
         ? `Analyze this screenshot (${attachment.name}) and update the app preview to fix or remove what needs changing while keeping the rest intact.`
         : `Attached reference: ${attachment?.name ?? 'file'}`);
-    onSendFollowUp(text, {
-      reactEnabled: mode === 'web',
-      backendEnabled: false,
-      webSearchEnabled,
-      attachmentName: attachment?.name ?? null,
-      attachmentDataUrl: attachment?.dataUrl ?? null,
-      attachmentMimeType: attachment?.mimeType ?? null,
-      attachmentText: attachment?.textContent ?? null,
-    });
+    onSendFollowUp(
+      text,
+      buildFollowUpOptions({
+        attachmentName: attachment?.name ?? null,
+        attachmentDataUrl: attachment?.dataUrl ?? null,
+        attachmentMimeType: attachment?.mimeType ?? null,
+        attachmentText: attachment?.textContent ?? null,
+      })
+    );
     setFollowUp('');
     setAttachment(null);
   };
@@ -610,7 +728,7 @@ export function BuilderWorkspace({
         {hasBuiltApp ? (
           <iframe
             ref={previewIframeRef}
-            key={`${projectId}-${previewKey}`}
+            key={`${projectId}-${previewKey}-${secretsFingerprint}`}
             title={`${projectTitle} Preview`}
             srcDoc={connectedPreviewHtml}
             sandbox="allow-scripts allow-forms allow-modals"
@@ -1276,12 +1394,7 @@ export function BuilderWorkspace({
                               type="button"
                               disabled={isStreaming}
                               onClick={() =>
-                                onSendFollowUp(suggestion, {
-                                  reactEnabled: mode === 'web',
-                                  backendEnabled: false,
-                                  webSearchEnabled,
-                                  attachmentName: null,
-                                })
+                                onSendFollowUp(suggestion, buildFollowUpOptions())
                               }
                               className="w-full text-left rounded-xl border border-black/[0.08] bg-white hover:bg-[#F7F7FA] hover:border-black/15 px-3.5 py-2.5 flex items-center justify-between gap-2.5 text-[13.5px] font-medium text-[#111118] transition-all active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed"
                             >
@@ -1484,8 +1597,9 @@ export function BuilderWorkspace({
               </div>
             )}
 
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
+            <div className="flex items-center justify-between gap-1.5 pt-0.5">
+              {/* Left: Attachment + Web Search */}
+              <div className="flex items-center gap-1.5 shrink-0">
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -1517,6 +1631,56 @@ export function BuilderWorkspace({
                 </button>
               </div>
 
+              {/* Center: Deploy, Database, Secrets evenly spaced */}
+              <div className="flex-1 min-w-0 grid grid-cols-3 items-center gap-0.5 px-0.5">
+                <button
+                  type="button"
+                  onClick={() => setActiveDrawer('deploy')}
+                  aria-label="Open project deployment panel"
+                  className={`w-full min-h-[38px] px-1 rounded-xl flex flex-col items-center justify-center gap-[3px] hover:bg-black/[0.04] active:scale-95 transition-all ${
+                    isPublished ? 'text-[#6D4AFF]' : 'text-[#52525B] hover:text-[#0B0B0F]'
+                  }`}
+                >
+                  <Rocket className="w-[14px] h-[14px] stroke-[1.9] shrink-0" />
+                  <span className="text-[10px] leading-none font-medium tracking-[-0.01em] whitespace-nowrap">
+                    Deploy
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveDrawer('database')}
+                  aria-label="Open project database and schema"
+                  className={`w-full min-h-[38px] px-1 rounded-xl flex flex-col items-center justify-center gap-[3px] hover:bg-black/[0.04] active:scale-95 transition-all ${
+                    databaseConfig.tables.length > 0
+                      ? 'text-[#6D4AFF]'
+                      : 'text-[#52525B] hover:text-[#0B0B0F]'
+                  }`}
+                >
+                  <Database className="w-[14px] h-[14px] stroke-[1.9] shrink-0" />
+                  <span className="text-[10px] leading-none font-medium tracking-[-0.01em] whitespace-nowrap">
+                    Database
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveDrawer('secrets')}
+                  aria-label="Open project secrets and environment variables"
+                  className={`w-full min-h-[38px] px-1 rounded-xl flex flex-col items-center justify-center gap-[3px] hover:bg-black/[0.04] active:scale-95 transition-all ${
+                    secrets.length > 0
+                      ? 'text-[#6D4AFF]'
+                      : 'text-[#52525B] hover:text-[#0B0B0F]'
+                  }`}
+                >
+                  <KeyRound className="w-[14px] h-[14px] stroke-[1.9] shrink-0" />
+                  <span className="text-[10px] leading-none font-medium tracking-[-0.01em] whitespace-nowrap">
+                    Secrets
+                  </span>
+                </button>
+              </div>
+
+              {/* Right: Send Button */}
               <button
                 type="button"
                 onClick={handleSubmit}
@@ -1526,7 +1690,7 @@ export function BuilderWorkspace({
                   backgroundColor:
                     hasContent && !isStreaming ? theme.sendActiveBg : '#BEB5F9',
                 }}
-                className="w-9 h-9 rounded-full flex items-center justify-center text-white transition-all duration-200 active:scale-95 disabled:cursor-default"
+                className="w-9 h-9 rounded-full shrink-0 flex items-center justify-center text-white transition-all duration-200 active:scale-95 disabled:cursor-default"
               >
                 {isStreaming ? (
                   <Loader2 className="w-[17px] h-[17px] animate-spin" />
@@ -1538,6 +1702,45 @@ export function BuilderWorkspace({
           </div>
         </div>
       </div>
+
+      {/* Per-Project Configuration Drawers */}
+      <ProjectSecretsModal
+        open={activeDrawer === 'secrets'}
+        projectTitle={projectTitle}
+        secrets={secrets}
+        onClose={() => setActiveDrawer(null)}
+        onUpdateSecrets={onUpdateSecrets}
+      />
+
+      <ProjectDatabaseModal
+        open={activeDrawer === 'database'}
+        projectId={projectId}
+        projectTitle={projectTitle}
+        latestPreviewHtml={latestPreviewHtml}
+        databaseConfig={databaseConfig}
+        onClose={() => setActiveDrawer(null)}
+        onUpdateDatabase={onUpdateDatabase}
+        onApplySchemaWithAi={(promptText) =>
+          onSendFollowUp(promptText, buildFollowUpOptions())
+        }
+      />
+
+      <ProjectDeployModal
+        open={activeDrawer === 'deploy'}
+        projectTitle={projectTitle}
+        mode={mode}
+        hasBuiltApp={hasBuiltApp}
+        isPublished={isPublished}
+        latestPreviewHtml={latestPreviewHtml}
+        secrets={secrets}
+        databaseConfig={databaseConfig}
+        deployment={deployment}
+        onClose={() => setActiveDrawer(null)}
+        onDeploy={(slug) => onDeployProject(slug)}
+        onOpenPreview={() => onSetView('preview')}
+        onOpenCode={() => onSetView('code')}
+        onShare={handleShare}
+      />
     </div>
   );
 }

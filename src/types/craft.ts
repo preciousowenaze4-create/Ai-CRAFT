@@ -59,6 +59,42 @@ export interface OpenRouterModel {
   isFree: boolean;
 }
 
+export interface ProjectSecret {
+  id: string;
+  key: string;
+  value: string;
+  updatedAt: string;
+}
+
+export interface ProjectDatabaseColumn {
+  name: string;
+  type: 'text' | 'number' | 'boolean' | 'timestamp' | 'json';
+  required?: boolean;
+}
+
+export interface ProjectDatabaseTable {
+  id: string;
+  name: string;
+  columns: ProjectDatabaseColumn[];
+  description?: string;
+}
+
+export interface ProjectDatabaseConfig {
+  enabled: boolean;
+  providerLabel: string;
+  apiUrl?: string;
+  tables: ProjectDatabaseTable[];
+  updatedAt?: string;
+}
+
+export interface ProjectDeploymentConfig {
+  status: 'draft' | 'deployed';
+  slug: string;
+  version: number;
+  deployedAt: string | null;
+  environment: 'production' | 'preview';
+}
+
 export interface ComposerOptions {
   reactEnabled: boolean;
   backendEnabled: boolean;
@@ -67,6 +103,8 @@ export interface ComposerOptions {
   attachmentDataUrl?: string | null;
   attachmentMimeType?: string | null;
   attachmentText?: string | null;
+  secretKeys?: string[];
+  databaseTables?: string[];
 }
 
 export interface BuilderTurn {

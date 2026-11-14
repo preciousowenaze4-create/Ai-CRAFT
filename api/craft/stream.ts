@@ -1017,6 +1017,8 @@ export async function POST(request: Request): Promise<Response> {
       attachmentDataUrl?: string | null;
       attachmentMimeType?: string | null;
       attachmentText?: string | null;
+      secretKeys?: string[];
+      databaseTables?: string[];
     };
   };
 
@@ -1049,6 +1051,18 @@ export async function POST(request: Request): Promise<Response> {
       ? options.attachmentText.trim().slice(0, 12000)
       : null;
   const webSearchEnabled = options.webSearchEnabled !== false;
+  const secretKeys = Array.isArray(options.secretKeys)
+    ? options.secretKeys
+        .filter((k): k is string => typeof k === 'string' && k.trim().length > 0)
+        .map((k) => k.trim())
+        .slice(0, 30)
+    : [];
+  const databaseTables = Array.isArray(options.databaseTables)
+    ? options.databaseTables
+        .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+        .map((t) => t.trim())
+        .slice(0, 20)
+    : [];
 
   if (!message) {
     return Response.json({ error: 'Prompt message is required.' }, { status: 400 });
@@ -1156,6 +1170,16 @@ export async function POST(request: Request): Promise<Response> {
         if (webSearchEnabled) activeFlags.push('Live browser web search');
         if (options.attachmentName) {
           activeFlags.push(`Attached reference: ${options.attachmentName}`);
+        }
+        if (secretKeys.length > 0) {
+          activeFlags.push(
+            `Configured project secrets (read via window.AICraft.getSecret(key) or window.ENV[key]): ${secretKeys.join(', ')}`
+          );
+        }
+        if (databaseTables.length > 0) {
+          activeFlags.push(
+            `Configured project database tables (persist via window.AICraft.db): ${databaseTables.join('; ')}`
+          );
         }
 
         const previewSummary = extractPreviewStructureSummary(previousHtml);
